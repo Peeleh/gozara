@@ -1,0 +1,19 @@
+[package]
+name = "node"
+version = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
+keywords = { workspace = true }
+categories = { workspace = true }
+
+[dependencies]
+peyk.workspace = true
+bincode.workspace = true
+clap.workspace = true
+dotenv.workspace = true
+eyre.workspace = true
+opentelemetry_sdk.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+serde_json.workspace = true 

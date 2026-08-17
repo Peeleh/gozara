@@ -1,0 +1,22 @@
+[package]
+name = "peyk"
+version = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
+keywords = { workspace = true }
+categories = { workspace = true }
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+serde.workspace = true
+async-trait.workspace = true
+# env_logger = "0.10.0"
+log.workspace = true
+futures.workspace = true
+libp2p.workspace = true
+libp2p-quic.workspace = true
+#libp2p-identify = "0.44.1"
+eyre.workspace = true
+tokio.workspace = true
+indicatif = { version = "0.18", features = ["tokio"] }

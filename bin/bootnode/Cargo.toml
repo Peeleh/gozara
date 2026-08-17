@@ -1,0 +1,23 @@
+[package]
+name = "bootnode"
+version = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
+keywords = { workspace = true }
+categories = { workspace = true }
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+futures.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+local-ip-address = "0.5.6"
+eyre.workspace = true
+
+libp2p.workspace = true
+peyk.workspace = true
