@@ -7,7 +7,7 @@ keywords = { workspace = true }
 categories = { workspace = true }
 
 [dependencies]
-peyk.workspace = true
+serde.workspace = true
 bincode.workspace = true
 clap.workspace = true
 dotenv.workspace = true
@@ -15,5 +15,16 @@ eyre.workspace = true
 opentelemetry_sdk.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+tokio-util.workspace = true
+dashmap.workspace = true
+axum.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 serde_json.workspace = true 
+futures.workspace = true
+libp2p.workspace = true
+libp2p-quic.workspace = true
+blake3.workspace = true
+rs_merkle.workspace = true
+hex.workspace = true
+peyk.workspace = true
