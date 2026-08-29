@@ -12,24 +12,16 @@ use tracing::{
 };
 use futures::stream::StreamExt;
 use tokio::{
-    sync::{mpsc},
+    sync::mpsc,
     time::interval
 };
 use tokio_stream::wrappers::IntervalStream;
 use rs_merkle::MerkleTree;
 use crate::network::SwarmRequest;
+use crate::blake3_wrapper::Blake3Hash;
 use crate::bridge::UploadRequest;
 
-#[derive(Clone)]
-struct Blake3Hash {}
-
-impl rs_merkle::Hasher for Blake3Hash {
-    type Hash = [u8; 32];
-
-    fn hash(data: &[u8]) -> [u8; 32] {
-        blake3::hash(data).into()
-    }
-}
+pub type Hash = [u8; 32];
 
 // 4 MB
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
@@ -37,7 +29,6 @@ const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 // 4 hours
 const RETENTION_TIME: u64 = 4 * 60 * 60;
 
-// mpsc message type
 pub enum BlobRequest {
     Store(String, Vec<u8>),
     Remove([u8; 32])
@@ -45,6 +36,7 @@ pub enum BlobRequest {
 
 struct Blob {
     pub root_hash: [u8; 32],
+    pub bridge_id: String,
     pub data: Vec<u8>,
     // [<start, end>]
     pub chunks: Vec<(usize, usize)>,
@@ -67,7 +59,7 @@ impl BlobStore {
         &mut self,
         id: String,
         data: Vec<u8>,
-    ) -> Result<()> {
+    ) -> Result<[u8; 32]> {
         if 0 == data.len() {
             return Err(eyre!("Ignored empty blob."));
         }
@@ -93,20 +85,22 @@ impl BlobStore {
             })
             .collect();
         info!(
-            "Blob `{}` cuhnked and stored with root hash(`{}`).",
+            "Blob `{}` is cuhnked and now stored locally with root hash(`{}`). We'll now try to persist it globally.",
             id,
             hex::encode(root_hash)
         );
         self.blobs.insert(
             root_hash, 
             Blob {
-                root_hash: root_hash,
+                root_hash: root_hash.clone(),
+                bridge_id: id,
                 data: data,
                 chunks: chunks,
                 created_at: Instant::now().elapsed().as_secs()
             }
         );
-        Ok(())
+
+        Ok(root_hash)
     }
 
     pub fn remove_blob(&mut self, root_hash: &[u8; 32]) {
@@ -116,6 +110,7 @@ impl BlobStore {
     // periodic cleanup
     pub fn remove_stale_blobs(&mut self) {
         let now = Instant::now().elapsed().as_secs();
+        // todo: inform the bridge
         self.blobs.retain(|_, v| {
             v.created_at + RETENTION_TIME < now
         })
@@ -144,11 +139,21 @@ pub async fn run(
                     Some(req) => {
                         match req {
                             BlobRequest::Store(id, data) => {
-                                if let Err(e) = blob_store.store_blob(id, data) {
-                                    warn!("Store blob error: {}", e);
-                                    continue;
-                                }
-                                // swarm_tx.send([0u8; 32])
+                                match blob_store.store_blob(id, data) {
+                                    Ok(root_hash) => {
+                                        if let Err(e) = swarm_tx.send(SwarmRequest::PersistBlob(root_hash)) {
+                                            warn!(
+                                                "Failed to send Persist request to the Swarm channel: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Store blob error: {}", e);
+                                        continue;                                        
+                                    }
+
+                                }                                
                             }
                             BlobRequest::Remove(root_hash) => {
                                 blob_store.remove_blob(&root_hash);

@@ -3,6 +3,7 @@ pub use config::NodeConfig;
 mod network;
 mod blob_store;
 mod bridge;
+mod blake3_wrapper;
 
 // use tracing::info;
 use eyre::Result;

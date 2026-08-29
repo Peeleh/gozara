@@ -22,8 +22,9 @@ use axum::{
     response::{Json, IntoResponse}
 };
 use dashmap::DashMap;
-// use blake3::Hash;
 use crate::blob_store::BlobRequest;
+
+type Hash = [u8; 32];
 
 // 1 GB
 const MAX_BLOB_SIZE: usize = 1 * 1024 * 1024 * 1024;
@@ -69,25 +70,28 @@ async fn get_status(
     }
 }
 
-async fn store_blob(
+async fn new_blob(
     State(state): State<AppState>,
     Path(id): Path<String>,
     body: Bytes
 ) -> impl IntoResponse {
     info!(
-        "Received {} KB for `{id}` from the artifact store.",
-        body.len() as f32 / 1024.0
+        "Received a new blob(`{}`) ~{}MB from the artifact store.",
+        id, 
+        body.len() as f32 / 1_048_576f32
     );
     if state.blobs.contains_key(&id) {
         warn!(
-            "ignored duplicate blob `{}`",
+            "Ignored duplicate blob(`{}`).",
             id
         );
         return StatusCode::INTERNAL_SERVER_ERROR
     }
-    if let Err(e) = state.blob_store_tx.send(BlobRequest::Store(id.clone(), body.into())) {
+    if let Err(e) = state.blob_store_tx.send(
+        BlobRequest::Store(id.clone(), body.into())
+    ) {
         warn!(
-            "Failed to send artifact store blob for storage: {:?}",
+            "Failed to send blob to the blob center: `{:?}`",
             e
         );
         return StatusCode::INTERNAL_SERVER_ERROR
@@ -109,15 +113,25 @@ pub async fn run(
                     Some(req) => {
                         match req {
                             UploadRequest::Success { id } => {
+                                if !my_state.blobs.contains_key(&id) {
+                                    warn!(
+                                        "Upload success for a missing blob: `{}`",
+                                        id
+                                    );
+                                }
                                 my_state.blobs.insert(id, UploadStatus::Finalized);
                             }
                             UploadRequest::Failed{ id, reason } => {
+                                warn!(
+                                    "Upload failed for a missing blob: `{}`",
+                                    id
+                                );
                                 my_state.blobs.insert(id, UploadStatus::Failed { reason });
                             }
                         }
                     }
                     None => {
-                        warn!("Store blob channel is closed.");
+                        warn!("Bridge channel is closed.");
                         break;
                     }
                 }                
@@ -127,7 +141,7 @@ pub async fn run(
 
     let app = Router::new()
         .route("/status/{id}", get(get_status))   
-        .route("/blob/{id}", post(store_blob))
+        .route("/blob/{id}", post(new_blob))
         .with_state(state)     
         .layer(DefaultBodyLimit::max(MAX_BLOB_SIZE));
 

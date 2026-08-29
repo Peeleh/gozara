@@ -31,10 +31,11 @@ use peyk::{
     // blob_transfer,
     protocol
 };
+use crate::blob_store::Hash;
 
 pub enum SwarmRequest {
-    RequestBlob(PeerId, [u8; 32]),
-    SendBlob(PeerId, [u8; 32], Vec<u8>)
+    NeedBlob(Hash),
+    PersistBlob(Hash)
 }
 
 pub async fn process_swarm(
@@ -59,11 +60,14 @@ pub async fn process_swarm(
                         .get_closest_peers(random_peer_id);
                 },
 
+                // blob events
                 r = rx.recv() =>  match r {
                     Some(sw_req) => {
                         match sw_req {
-                            SwarmRequest::RequestBlob(_peer_id, _hash) => {}
-                            SwarmRequest::SendBlob(_peer_id, _hash, _blob) => {}
+                            SwarmRequest::NeedBlob(_hash) => {}
+                            SwarmRequest::PersistBlob(_hash) => {
+                                
+                            }
                         }
                     }
                     None => {
