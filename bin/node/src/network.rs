@@ -31,16 +31,16 @@ use peyk::{
     // blob_transfer,
     protocol
 };
-use crate::blob_store::Hash;
+use crate::blob_store::{Hash, BlobMessage};
 
-pub enum SwarmRequest {
+pub enum SwarmMessage {
     NeedBlob(Hash),
     PersistBlob(Hash)
 }
 
 pub async fn process_swarm(
     mut swarm: Swarm<peyk::p2p::GlobalBehaviour>,
-    mut rx: mpsc::UnboundedReceiver<SwarmRequest>
+    mut rx: mpsc::UnboundedReceiver<SwarmMessage>
 ) -> Result<()> {
     tokio::spawn(async move {
         // to update kademlia tables
@@ -64,9 +64,8 @@ pub async fn process_swarm(
                 r = rx.recv() =>  match r {
                     Some(sw_req) => {
                         match sw_req {
-                            SwarmRequest::NeedBlob(_hash) => {}
-                            SwarmRequest::PersistBlob(_hash) => {
-                                
+                            SwarmMessage::NeedBlob(_hash) => {}
+                            SwarmMessage::PersistBlob(_hash) => {                                
                             }
                         }
                     }
@@ -225,7 +224,8 @@ pub async fn process_swarm(
 
 pub async fn go_public(
     config: NodeConfig,
-    mut rx: mpsc::UnboundedReceiver<SwarmRequest>
+    rx: mpsc::UnboundedReceiver<SwarmMessage>,
+    blob_tx: mpsc::UnboundedSender<BlobMessage>
 ) -> Result<()> {
     // derive peer id
     let local_key = {
