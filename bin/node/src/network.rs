@@ -31,11 +31,11 @@ use peyk::{
     // blob_transfer,
     protocol
 };
-use crate::blob_store::{Hash, BlobMessage};
+use crate::blob_store::{BlobMessage};
 
 pub enum SwarmMessage {
-    NeedBlob(Hash),
-    PersistBlob(Hash)
+    NeedBlob(String),
+    PersistBlob(String)
 }
 
 pub async fn process_swarm(

@@ -40,7 +40,16 @@ const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const RETENTION_TIME: u64 = 4 * 60 * 60;
 
 pub enum BlobMessage {
-    Store(String, Bytes),
+    // comes from the bridge
+    Store {
+        id: String,
+        data: Bytes
+    },
+    // comes from the swarm
+    Persist {
+        id: String,
+        result: bool
+    }
 }
 
 // 1 GB
@@ -94,7 +103,7 @@ impl BlobStore {
         &mut self,
         id: String,
         data: Bytes,
-    ) -> Result<Hash> {
+    ) -> Result<()> {
         if 0 == data.len() {
             return Err(eyre!("Ignored empty blob."));
         }
@@ -134,7 +143,7 @@ impl BlobStore {
             }
         );
 
-        Ok(root_hash)
+        Ok(())
     }
 
     pub fn remove_blob(&mut self, id: &str) {
@@ -154,6 +163,7 @@ impl BlobStore {
 async fn start_blob_store(
     mut blob_rx: mpsc::UnboundedReceiver<BlobMessage>,
     swarm_tx: mpsc::UnboundedSender<SwarmMessage>,
+    bridge_state: BridgeState,
 ) -> Result<()> {
     let mut blob_store = BlobStore::new();        
     tokio::spawn(async move {
@@ -168,29 +178,37 @@ async fn start_blob_store(
                     blob_store.remove_stale_blobs();
                 },
                                 
-                r = blob_rx.recv() =>  match r {
-                    Some(req) => {
-                        match req {
-                            BlobMessage::Store(id, data) => {
-                                match blob_store.store_blob(id, data) {
-                                    Ok(root_hash) => {
-                                        if let Err(e) = swarm_tx.send(SwarmMessage::PersistBlob(root_hash)) {
+                m = blob_rx.recv() =>  match m {
+                    Some(msg) => {
+                        match msg {
+                            BlobMessage::Store{id, data} => {
+                                match blob_store.store_blob(id.clone(), data) {
+                                    Ok(()) => {
+                                        if let Err(e) = swarm_tx.send(SwarmMessage::PersistBlob(id.clone())) {
                                             warn!(
                                                 "Failed to send Persist message to the Swarm channel: {}",
                                                 e
                                             );
+                                            bridge_state.upload_status.insert(
+                                                id,
+                                                UploadStatus::Failed{ reason: e.to_string() }
+                                            );
+                                            // todo: retry
                                         }
                                     }
                                     Err(e) => {
                                         warn!("Store blob error: {}", e);
+                                        bridge_state.upload_status.insert(
+                                            id,
+                                            UploadStatus::Failed{ reason: e.to_string() }
+                                        );
+                                        // todo: retry
                                         continue;                                        
                                     }
 
                                 }                                
                             }
-                            // BlobMessage::Remove(root_hash) => {
-                            //     blob_store.remove_blob(&root_hash);
-                            // }
+                            BlobMessage::Persist{id: _, result: _} => {}
                         }
                     }
                     None => {
@@ -232,7 +250,7 @@ async fn new_blob(
         return StatusCode::INTERNAL_SERVER_ERROR
     }
     if let Err(e) = state.blob_store_tx.send(
-        BlobMessage::Store(id.clone(), body)
+        BlobMessage::Store{id: id.clone(), data: body}
     ) {
         warn!(
             "Failed to send blob to the blob center: `{:?}`",
@@ -245,13 +263,12 @@ async fn new_blob(
 }
 
 async fn serve_bridge(
-    blob_tx: mpsc::UnboundedSender<BlobMessage>,
-) -> Result<()> {
-    let state = BridgeState::new(blob_tx);
+    state: BridgeState,
+) -> Result<()> {    
     let app = Router::new()
         .route("/status/{id}", get(get_status))   
         .route("/blob/{id}", post(new_blob))
-        .with_state(state)     
+        .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_BLOB_SIZE));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8709").await.unwrap();
@@ -267,7 +284,8 @@ pub async fn run(
     rx: mpsc::UnboundedReceiver<BlobMessage>,
     swarm_tx: mpsc::UnboundedSender<SwarmMessage>
 ) -> Result<()> {
-    start_blob_store(rx, swarm_tx).await?;
-    serve_bridge(tx).await?;
+    let bridge_state = BridgeState::new(tx);
+    start_blob_store(rx, swarm_tx, bridge_state.clone()).await?;
+    serve_bridge(bridge_state).await?;
     Ok(())
 }
