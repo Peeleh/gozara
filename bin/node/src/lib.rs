@@ -11,8 +11,8 @@ use tokio::sync::mpsc;
 pub async fn run(
     config: NodeConfig,
 ) -> Result<()> {
-    let (swarm_tx, swarm_rx) = mpsc::unbounded_channel::<network::SwarmMessage>();
-    let (blob_tx, blob_rx) = mpsc::unbounded_channel::<blob_store::BlobMessage>();
+    let (swarm_tx, swarm_rx) = mpsc::channel::<network::SwarmMessage>(16);
+    let (blob_tx, blob_rx) = mpsc::channel::<blob_store::BlobMessage>(4);
     network::go_public(config, swarm_rx, blob_tx.clone()).await?;    
     blob_store::run(blob_tx, blob_rx, swarm_tx).await?;
     Ok(())

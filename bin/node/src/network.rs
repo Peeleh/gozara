@@ -40,7 +40,7 @@ pub enum SwarmMessage {
 
 pub async fn process_swarm(
     mut swarm: Swarm<peyk::p2p::GlobalBehaviour>,
-    mut rx: mpsc::UnboundedReceiver<SwarmMessage>
+    mut rx: mpsc::Receiver<SwarmMessage>
 ) -> Result<()> {
     tokio::spawn(async move {
         // to update kademlia tables
@@ -224,8 +224,8 @@ pub async fn process_swarm(
 
 pub async fn go_public(
     config: NodeConfig,
-    rx: mpsc::UnboundedReceiver<SwarmMessage>,
-    blob_tx: mpsc::UnboundedSender<BlobMessage>
+    rx: mpsc::Receiver<SwarmMessage>,
+    blob_tx: mpsc::Sender<BlobMessage>
 ) -> Result<()> {
     // derive peer id
     let local_key = {

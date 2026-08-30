@@ -66,11 +66,11 @@ enum UploadStatus {
 #[derive(Clone)]
 struct BridgeState {
     upload_status: Arc<DashMap<String, UploadStatus>>,
-    blob_store_tx: mpsc::UnboundedSender<BlobMessage>,
+    blob_store_tx: mpsc::Sender<BlobMessage>,
 }
 
 impl BridgeState {
-    pub fn new(blob_tx: mpsc::UnboundedSender<BlobMessage>) -> Self {
+    pub fn new(blob_tx: mpsc::Sender<BlobMessage>) -> Self {
         BridgeState {
             upload_status: Arc::new(DashMap::new()),
             blob_store_tx: blob_tx
@@ -161,8 +161,8 @@ impl BlobStore {
 }
 
 async fn start_blob_store(
-    mut blob_rx: mpsc::UnboundedReceiver<BlobMessage>,
-    swarm_tx: mpsc::UnboundedSender<SwarmMessage>,
+    mut blob_rx: mpsc::Receiver<BlobMessage>,
+    swarm_tx: mpsc::Sender<SwarmMessage>,
     bridge_state: BridgeState,
 ) -> Result<()> {
     let mut blob_store = BlobStore::new();        
@@ -184,7 +184,7 @@ async fn start_blob_store(
                             BlobMessage::Store{id, data} => {
                                 match blob_store.store_blob(id.clone(), data) {
                                     Ok(()) => {
-                                        if let Err(e) = swarm_tx.send(SwarmMessage::PersistBlob(id.clone())) {
+                                        if let Err(e) = swarm_tx.send(SwarmMessage::PersistBlob(id.clone())).await {
                                             warn!(
                                                 "Failed to send Persist message to the Swarm channel: {}",
                                                 e
@@ -251,7 +251,7 @@ async fn new_blob(
     }
     if let Err(e) = state.blob_store_tx.send(
         BlobMessage::Store{id: id.clone(), data: body}
-    ) {
+    ).await {
         warn!(
             "Failed to send blob to the blob center: `{:?}`",
             e
@@ -280,9 +280,9 @@ async fn serve_bridge(
 }
 
 pub async fn run(
-    tx: mpsc::UnboundedSender<BlobMessage>,
-    rx: mpsc::UnboundedReceiver<BlobMessage>,
-    swarm_tx: mpsc::UnboundedSender<SwarmMessage>
+    tx: mpsc::Sender<BlobMessage>,
+    rx: mpsc::Receiver<BlobMessage>,
+    swarm_tx: mpsc::Sender<SwarmMessage>
 ) -> Result<()> {
     let bridge_state = BridgeState::new(tx);
     start_blob_store(rx, swarm_tx, bridge_state.clone()).await?;
