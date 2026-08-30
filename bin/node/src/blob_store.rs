@@ -75,7 +75,6 @@ struct Blob {
     pub data: Bytes,
     // [<start, end>]
     pub chunks: Vec<(usize, usize)>,
-    pub status: UploadStatus,
     pub created_at: u64,
 }
 
@@ -131,7 +130,6 @@ impl BlobStore {
                 bridge_id: id,
                 data: data,
                 chunks: chunks,
-                status: UploadStatus::Pending,
                 created_at: Instant::now().elapsed().as_secs()
             }
         );
