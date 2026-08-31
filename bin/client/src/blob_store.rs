@@ -190,7 +190,7 @@ async fn start_blob_store(
                             BlobMessage::Store{id, data} => {
                                 match blob_store.store_blob(id.clone(), data) {
                                     Ok(()) => {
-                                        if let Err(e) = swarm_tx.send(SwarmMessage::PersistBlob(id.clone())).await {
+                                        if let Err(e) = swarm_tx.send(SwarmMessage::PersistBlob { id: id.clone() }).await {
                                             warn!(
                                                 "Failed to send Persist message to the Swarm channel: {}",
                                                 e

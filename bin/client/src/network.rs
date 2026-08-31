@@ -34,13 +34,13 @@ use peyk::{
 use crate::blob_store::{BlobMessage};
 
 pub enum SwarmMessage {
-    NeedBlob(String),
-    PersistBlob(String)
+    PersistBlob { id: String }
 }
 
 pub async fn process_swarm(
     mut swarm: Swarm<peyk::p2p::GlobalBehaviour>,
-    mut rx: mpsc::Receiver<SwarmMessage>
+    mut rx: mpsc::Receiver<SwarmMessage>,
+    blob_tx: mpsc::Sender<BlobMessage>
 ) -> Result<()> {
     tokio::spawn(async move {
         // to update kademlia tables
@@ -64,8 +64,7 @@ pub async fn process_swarm(
                 r = rx.recv() =>  match r {
                     Some(sw_req) => {
                         match sw_req {
-                            SwarmMessage::NeedBlob(_hash) => {}
-                            SwarmMessage::PersistBlob(_hash) => {                                
+                            SwarmMessage::PersistBlob { id: _id } => {
                             }
                         }
                     }
@@ -263,7 +262,7 @@ pub async fn go_public(
     //     "/ip6/::/tcp/20201".parse()?
     // )?;
     // gossip
-    // topic example: "gozara-me" for the middle east zone
+    // topic example: "gozara-me-zone" for the middle east zone
     let topic = gossipsub::IdentTopic::new(format!("gozara-{}-zone", config.zone));
     let _ = swarm
         .behaviour_mut()
@@ -313,6 +312,6 @@ pub async fn go_public(
         )
         .parse()?
     );    
-    process_swarm(swarm, rx).await?;
+    process_swarm(swarm, rx, blob_tx).await?;
     Ok(())
 }
