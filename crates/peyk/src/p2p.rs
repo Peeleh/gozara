@@ -89,7 +89,7 @@ fn prepare_blob_transfer_behaviour()
 }
 
 // prepare identify behaviour
-pub(crate) fn prepare_identify_behaviour(
+pub fn prepare_identify_behaviour(
     public_key: &identity::PublicKey
 )-> identify::Behaviour {
     identify::Behaviour::new(
@@ -121,7 +121,7 @@ pub struct GlobalBehaviour {
     pub blob_transfer: request_response::Behaviour<blob_transfer::BlobCodec>,
 }
 
-pub(crate) fn prepare_kademlia_behaviour(
+pub fn prepare_kademlia_behaviour(
     public_key: &identity::PublicKey,
 ) -> kad::Behaviour<MemoryStore> {
     let mut cfg = kad::Config::new(

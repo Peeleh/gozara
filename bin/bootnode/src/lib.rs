@@ -1,19 +1,25 @@
-use std::time::Duration;
-use eyre::Result;
+use std::{
+    time::Duration,
+//     hash::{
+//         Hash,
+//         Hasher
+//     },
+//     collections::hash_map::DefaultHasher
+};
 use libp2p::{
     tcp,
     yamux,
     noise,
     identity,
     identify,
-    kad,
-    kad::store::MemoryStore,
+    kad, kad::store::MemoryStore,
     swarm::{
         Swarm,
         NetworkBehaviour,
     },
 };
-use crate::p2p;
+use eyre::Result;
+use peyk::p2p;
 
 // used by bootnodes for peer discovery
 #[derive(NetworkBehaviour)]

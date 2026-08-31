@@ -390,6 +390,7 @@ dependencies = [
  "eyre",
  "futures",
  "libp2p",
+ "libp2p-quic",
  "local-ip-address",
  "peyk",
  "tokio",

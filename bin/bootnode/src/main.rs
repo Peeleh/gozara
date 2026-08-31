@@ -21,11 +21,7 @@ use libp2p::{
 
 // use tracing_subscriber::EnvFilter;
 use clap::Parser;
-
-use peyk::bootnode::{
-    BootNodeBehaviourEvent,
-    setup_swarm_for_bootnode
-};
+use bootnode::{BootNodeBehaviourEvent, setup_swarm_for_bootnode};
 
 // CLI
 #[derive(Parser, Debug)]
