@@ -25,8 +25,8 @@ use bootnode::{BootNodeBehaviourEvent, setup_swarm_for_bootnode};
 
 // CLI
 #[derive(Parser, Debug)]
-#[command(name = "Bootnode CLI for Wholesum: p2p verifiable computing marketplace.")]
-#[command(author = "Wholesum team")]
+#[command(name = "Bootnode CLI for Gozara: p2p verifiable computing marketplace.")]
+#[command(author = "Gozara team")]
 #[command(version = "0.1")]
 #[command(about = "Yet another verifiable compute marketplace.", long_about = None)]
 struct Cli {

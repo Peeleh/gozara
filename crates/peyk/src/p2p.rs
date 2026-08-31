@@ -64,7 +64,7 @@ fn prepare_request_response_behaviour()
 {
     request_response::cbor::Behaviour::<protocol::Request, protocol::Response>::new(
         [(
-            StreamProtocol::new("/wholesum/req_resp/1.0"),
+            StreamProtocol::new("/gozara/req_resp/1.0"),
             request_response::ProtocolSupport::Full,
         )],
         request_response::Config::default(),
@@ -78,7 +78,7 @@ fn prepare_blob_transfer_behaviour()
     request_response::Behaviour::with_codec(
         blob_transfer::BlobCodec,
         [(
-            StreamProtocol::new("/wholesum/blob_transfer/1.0"),
+            StreamProtocol::new("/gozara/blob_transfer/1.0"),
             request_response::ProtocolSupport::Full,
         )],
         request_response::Config::default()
@@ -94,7 +94,7 @@ pub fn prepare_identify_behaviour(
 )-> identify::Behaviour {
     identify::Behaviour::new(
         identify::Config::new(
-            String::from("/wholesum/identify/1.0"),
+            String::from("/gozara/identify/1.0"),
             public_key.clone()
         )
     )
@@ -125,7 +125,7 @@ pub fn prepare_kademlia_behaviour(
     public_key: &identity::PublicKey,
 ) -> kad::Behaviour<MemoryStore> {
     let mut cfg = kad::Config::new(
-        StreamProtocol::new("/wholesum/kad/1.0")
+        StreamProtocol::new("/gozara/kad/1.0")
     );
     cfg.set_query_timeout(Duration::from_secs(5 * 60));    
     let local_peer_id = PeerId::from(public_key.clone());
