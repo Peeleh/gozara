@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "bin/bootnode",    
-    "bin/node",
+    "bin/client",
     "crates/peyk",    
 ]
 [workspace.package]
