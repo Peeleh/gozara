@@ -65,14 +65,14 @@ enum UploadStatus {
 
 #[derive(Clone)]
 struct BridgeState {
-    upload_status: Arc<DashMap<String, UploadStatus>>,
+    upload_status_map: Arc<DashMap<String, UploadStatus>>,
     blob_store_tx: mpsc::Sender<BlobMessage>,
 }
 
 impl BridgeState {
     pub fn new(blob_tx: mpsc::Sender<BlobMessage>) -> Self {
         BridgeState {
-            upload_status: Arc::new(DashMap::new()),
+            upload_status_map: Arc::new(DashMap::new()),
             blob_store_tx: blob_tx
         }
     }
@@ -151,12 +151,18 @@ impl BlobStore {
     }
 
     // periodic cleanup
-    pub fn remove_stale_blobs(&mut self) {
+    pub fn remove_stale_blobs(
+        &mut self,
+        bridge_state: BridgeState
+    ) {
         let now = Instant::now().elapsed().as_secs();
-        // todo: inform the bridge
         self.blobs.retain(|_, v| {
             v.created_at + RETENTION_TIME < now
-        })
+        });
+        bridge_state.upload_status_map.retain(|k, _| {
+            self.blobs.contains_key(k)
+        });
+        // todo: inform the bridge?
     }
 }
 
@@ -175,7 +181,7 @@ async fn start_blob_store(
         loop {
             tokio::select! {
                 _i = timer_stale_blobs.select_next_some() => {                
-                    blob_store.remove_stale_blobs();
+                    blob_store.remove_stale_blobs(bridge_state.clone());
                 },
                                 
                 m = blob_rx.recv() =>  match m {
@@ -189,7 +195,7 @@ async fn start_blob_store(
                                                 "Failed to send Persist message to the Swarm channel: {}",
                                                 e
                                             );
-                                            bridge_state.upload_status.insert(
+                                            bridge_state.upload_status_map.insert(
                                                 id,
                                                 UploadStatus::Failed{ reason: e.to_string() }
                                             );
@@ -198,7 +204,7 @@ async fn start_blob_store(
                                     }
                                     Err(e) => {
                                         warn!("Store blob error: {}", e);
-                                        bridge_state.upload_status.insert(
+                                        bridge_state.upload_status_map.insert(
                                             id,
                                             UploadStatus::Failed{ reason: e.to_string() }
                                         );
@@ -226,7 +232,7 @@ async fn get_status(
     State(state): State<BridgeState>,
     Path(id): Path<String>
 ) -> impl IntoResponse {
-    match state.upload_status.get(&id) {
+    match state.upload_status_map.get(&id) {
         Some(status) => (StatusCode::OK, Json(status.clone())).into_response(),
         None => StatusCode::NOT_FOUND.into_response()
     }
@@ -242,7 +248,7 @@ async fn new_blob(
         id, 
         body.len() as f32 / 1_048_576f32
     );
-    if state.upload_status.contains_key(&id) {
+    if state.upload_status_map.contains_key(&id) {
         warn!(
             "Ignored duplicate blob(`{}`).",
             id
@@ -258,7 +264,7 @@ async fn new_blob(
         );
         return StatusCode::INTERNAL_SERVER_ERROR
     }
-    state.upload_status.insert(id, UploadStatus::Pending);
+    state.upload_status_map.insert(id, UploadStatus::Pending);
     StatusCode::CREATED
 }
 
