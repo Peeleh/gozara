@@ -28,7 +28,7 @@ use axum::{
 use dashmap::DashMap;
 use tokio_stream::wrappers::IntervalStream;
 use rs_merkle::MerkleTree;
-use crate::network::SwarmMessage;
+use peyk::SwarmMessage;
 use crate::blake3_wrapper::Blake3Hash;
 
 pub type Hash = [u8; 32];
@@ -286,12 +286,11 @@ async fn serve_bridge(
 }
 
 pub async fn run(
-    tx: mpsc::Sender<BlobMessage>,
-    rx: mpsc::Receiver<BlobMessage>,
-    swarm_tx: mpsc::Sender<SwarmMessage>
+    tx_swarm: mpsc::Sender<SwarmMessage>
 ) -> Result<()> {
+    let (tx, rx) = mpsc::channel::<BlobMessage>(4);
     let bridge_state = BridgeState::new(tx);
-    start_blob_store(rx, swarm_tx, bridge_state.clone()).await?;
+    start_blob_store(rx, tx_swarm, bridge_state.clone()).await?;
     serve_bridge(bridge_state).await?;
     Ok(())
 }

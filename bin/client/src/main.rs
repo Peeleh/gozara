@@ -1,4 +1,4 @@
-use node::NodeConfig;
+use client::Config;
 use std::env;
 // use opentelemetry_sdk::Resource;
 use tracing::info;
@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
         eprintln!("not loading .env file: {e}");
     }
     info!("Loading environment variables.");
-    let cfg = NodeConfig {
+    let cfg = Config {
         grpc_addr: env::var("NODE_GRPC_ADDR")
             .with_context(|| "`NODE_GRPC_ADDR` is missing")?,
         key_file: env::var("KEY_FILE").ok(),
@@ -32,6 +32,6 @@ async fn main() -> Result<()> {
             .with_context(|| "`EXTERNAL_PORT` is missing")?,
         zone: env::var("ZONE").unwrap_or("ME".to_string()),
     };
-    node::run(cfg).await?;
+    client::run(cfg).await?;
     Ok(())
 }

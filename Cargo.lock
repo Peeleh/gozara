@@ -547,6 +547,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "client"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bincode",
+ "blake3",
+ "clap",
+ "dashmap",
+ "dotenv",
+ "eyre",
+ "futures",
+ "hex",
+ "libp2p",
+ "libp2p-quic",
+ "opentelemetry_sdk",
+ "peyk",
+ "rs_merkle",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2294,33 +2321,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "node"
-version = "0.1.0"
-dependencies = [
- "axum",
- "bincode",
- "blake3",
- "clap",
- "dashmap",
- "dotenv",
- "eyre",
- "futures",
- "hex",
- "libp2p",
- "libp2p-quic",
- "opentelemetry_sdk",
- "peyk",
- "rs_merkle",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2508,6 +2508,7 @@ name = "peyk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bincode",
  "eyre",
  "futures",
  "indicatif",
@@ -2516,6 +2517,8 @@ dependencies = [
  "log",
  "serde",
  "tokio",
+ "tokio-stream",
+ "tracing",
 ]
 
 [[package]]
