@@ -3,14 +3,8 @@ use std::{
     sync::Arc,
     collections::HashMap,
 };
-use eyre::{
-    eyre,
-    Result
-};
-use tracing::{
-    info,
-    warn
-};
+use eyre::{eyre, Result};
+use tracing::{info, warn};
 use serde::Serialize;
 use futures::stream::StreamExt;
 use tokio::{
@@ -172,11 +166,11 @@ async fn start_blob_store(
     bridge_state: BridgeState,
 ) -> Result<()> {
     let mut blob_store = BlobStore::new();        
+    // to remove stale blobs
+    let mut timer_stale_blobs = IntervalStream::new(
+        interval(Duration::from_secs(60))
+    ).fuse();
     tokio::spawn(async move {
-        // to remove stale blobs
-        let mut timer_stale_blobs = IntervalStream::new(
-            interval(Duration::from_secs(60))
-        ).fuse();
 
         loop {
             tokio::select! {

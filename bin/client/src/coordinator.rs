@@ -1,18 +1,31 @@
-use std::collections::HashMap;
+use std::{
+    time::{Instant, Duration},
+    collections::HashMap
+};
 use eyre::Result;
 use tracing::{info, warn};
+use futures::StreamExt;
+use tokio::{
+    sync::mpsc,
+    time::interval
+};
+use tokio_stream::wrappers::IntervalStream;
 use libp2p::{
-    identity,
-    gossipsub,
+    // identity,
+    // gossipsub,
+    // swarm::Swarm,
     PeerId,
 };
-use tokio::sync::mpsc;
-use libp2p::swarm::Swarm;
 use crate::blob_store::Hash;
 use peyk::{HandlerMessage, SwarmMessage};
 
+struct StorageProviderSpecs {
+    pub capacity: u32,
+    pub created_at: u64,
+}
+
 struct State {
-    pub active_storage_providers: HashMap<PeerId, u32>,
+    pub active_storage_providers: HashMap<PeerId, StorageProviderSpecs>,
 }
 
 impl State {
@@ -37,9 +50,22 @@ pub async fn run(
     tx_swarm: mpsc::Sender<SwarmMessage>
 ) -> Result<()> {
     let mut state = State::new();
+    // remove stale storage providers every ~5 minutes
+    const STORAGE_PROVIDER_DECAY: u64 = 5 * 60;
+    let mut timer_stale_providers = IntervalStream::new(
+        interval(Duration::from_secs(30))
+    ).fuse();
     tokio::spawn(async move {
         loop {
             tokio::select! {
+                _i = timer_stale_providers.select_next_some() => {
+                    let now = Instant::now().elapsed().as_secs();
+                    state
+                        .active_storage_providers                                        
+                        .retain(|_, v| {
+                            v.created_at + STORAGE_PROVIDER_DECAY < now
+                        });
+                },
                 // swarm handlers
                 hm = rx_handler.recv() =>  match hm {
                     Some(h_msg) => {
@@ -49,7 +75,10 @@ pub async fn run(
                                 peer_id,
                                 capacity,
                             } => {
-                                state.active_storage_providers.insert(peer_id, capacity);
+                                state.active_storage_providers.insert(peer_id, StorageProviderSpecs {
+                                    capacity: capacity,
+                                    created_at: Instant::now().elapsed().as_secs()
+                                });
                             }
                             HandlerMessage::Request {
                                 peer_id,
