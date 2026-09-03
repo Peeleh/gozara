@@ -28,7 +28,7 @@ use axum::{
 use dashmap::DashMap;
 use tokio_stream::wrappers::IntervalStream;
 use rs_merkle::MerkleTree;
-use peyk::SwarmMessage;
+use crate::coordinator::CoordMessage;
 use crate::blake3_wrapper::Blake3Hash;
 
 pub type Hash = [u8; 32];
@@ -167,8 +167,8 @@ impl BlobStore {
 }
 
 async fn start_blob_store(
-    mut blob_rx: mpsc::Receiver<BlobMessage>,
-    swarm_tx: mpsc::Sender<SwarmMessage>,
+    mut rx_blob: mpsc::Receiver<BlobMessage>,
+    tx_coord: mpsc::Sender<CoordMessage>,
     bridge_state: BridgeState,
 ) -> Result<()> {
     let mut blob_store = BlobStore::new();        
@@ -184,15 +184,21 @@ async fn start_blob_store(
                     blob_store.remove_stale_blobs(bridge_state.clone());
                 },
                                 
-                m = blob_rx.recv() =>  match m {
-                    Some(msg) => {
-                        match msg {
+                m = rx_blob.recv() =>  match m {
+                    Some(bm) => {
+                        match bm {
                             BlobMessage::Store{id, data} => {
                                 match blob_store.store_blob(id.clone(), data) {
-                                    Ok(()) => {
-                                        if let Err(e) = swarm_tx.send(SwarmMessage::PersistBlob { id: id.clone() }).await {
+                                    Ok(_) => {
+                                        let blob = blob_store.blobs.get(&id).unwrap();
+                                        // time to send it out baby
+                                        if let Err(e) = tx_coord.send(CoordMessage::DiffuseBlob {
+                                            id: id.clone(),
+                                            root_hash: blob.root_hash,
+                                            num_chunks: blob.chunks.len()
+                                        }).await {
                                             warn!(
-                                                "Failed to send Persist message to the Swarm channel: {}",
+                                                "Failed to send diffuse message to the coordinator's channel: {}",
                                                 e
                                             );
                                             bridge_state.upload_status_map.insert(
@@ -286,11 +292,11 @@ async fn serve_bridge(
 }
 
 pub async fn run(
-    tx_swarm: mpsc::Sender<SwarmMessage>
+    tx_coord: mpsc::Sender<CoordMessage>
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel::<BlobMessage>(4);
     let bridge_state = BridgeState::new(tx);
-    start_blob_store(rx, tx_swarm, bridge_state.clone()).await?;
+    start_blob_store(rx, tx_coord, bridge_state.clone()).await?;
     serve_bridge(bridge_state).await?;
     Ok(())
 }

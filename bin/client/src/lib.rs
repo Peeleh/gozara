@@ -1,6 +1,10 @@
 mod blob_store;
 mod blake3_wrapper;
+mod coordinator;
 
+use std::{
+    fs,
+};
 use eyre::Result;
 use tracing::{info, warn};
 use libp2p::{
@@ -28,13 +32,13 @@ async fn go_public(
     // derive peer id
     let local_key = {
         if let Some(key_file) = config.key_file {
-            let bytes = std::fs::read(key_file)?;
+            let bytes = fs::read(key_file)?;
             identity::Keypair::from_protobuf_encoding(&bytes)?
         } else {
             // Create a random key for ourselves
             let new_key = identity::Keypair::generate_ed25519();
             let bytes = new_key.to_protobuf_encoding().unwrap();
-            let _bw = std::fs::write("./key.secret", bytes);
+            let _bw = fs::write("./key.secret", bytes);
             warn!("No keys were supplied, so one is generated for you and saved to `./key.secret` file.");
             new_key
         }
@@ -114,14 +118,15 @@ async fn go_public(
     Ok(swarm)
 }
 
-
 pub async fn run(
     config: Config,
 ) -> Result<()> {
     let swarm = go_public(config).await?;
     let (tx_swarm, rx_swarm) = mpsc::channel::<peyk::SwarmMessage>(16);
-    let (tx_handler, rx_handler) = mpsc::channel::<peyk::HandlerMessage>(64);
-    peyk::process_swarm(swarm, rx_swarm, tx_handler).await?;        
-    blob_store::run(tx_swarm).await?;
+    let (tx_handler, rx_handler) = mpsc::channel::<peyk::HandlerMessage>(256);
+    let (tx_coord, rx_coord) = mpsc::channel::<coordinator::CoordMessage>(256);
+    peyk::process_swarm(swarm, rx_swarm, tx_handler).await?; 
+    coordinator::run(rx_coord, rx_handler, tx_swarm).await?;
+    blob_store::run(tx_coord).await?;
     Ok(())
 }

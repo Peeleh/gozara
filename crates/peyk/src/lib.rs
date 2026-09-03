@@ -31,9 +31,9 @@ pub enum SwarmMessage {
 
 // consumers handle inbound messages
 pub enum HandlerMessage {
-    Gossip {
+    WouldStore {
         peer_id: PeerId, 
-        data: protocol::WouldStore,
+        capacity: u32,
     },
     Request {
         peer_id: PeerId,
@@ -143,11 +143,11 @@ pub async fn process_swarm(
                         message,
                         ..
                     })) => {
-                        match bincode::deserialize::<protocol::WouldStore>(&message.data) {
-                            Ok(_) => {
-                                if let Err(e) = tx_handler.send(HandlerMessage::Gossip {
+                        match bincode::deserialize::<u32>(&message.data) {
+                            Ok(capacity) => {
+                                if let Err(e) = tx_handler.send(HandlerMessage::WouldStore {
                                     peer_id: peer_id,
-                                    data: protocol::WouldStore
+                                    capacity: capacity
                                 }).await {
                                     warn!(
                                         "Gossip notify error: `{:?}`",
