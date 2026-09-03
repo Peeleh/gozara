@@ -19,13 +19,13 @@ use libp2p::{
 use crate::blob_store::Hash;
 use peyk::{HandlerMessage, SwarmMessage};
 
-struct StorageProviderSpecs {
+struct StorageProviderHints {
     pub capacity: u32,
     pub created_at: u64,
 }
 
 struct State {
-    pub active_storage_providers: HashMap<PeerId, StorageProviderSpecs>,
+    pub active_storage_providers: HashMap<PeerId, StorageProviderHints>,
 }
 
 impl State {
@@ -75,7 +75,7 @@ pub async fn run(
                                 peer_id,
                                 capacity,
                             } => {
-                                state.active_storage_providers.insert(peer_id, StorageProviderSpecs {
+                                state.active_storage_providers.insert(peer_id, StorageProviderHints {
                                     capacity: capacity,
                                     created_at: Instant::now().elapsed().as_secs()
                                 });
