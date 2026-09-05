@@ -33,7 +33,7 @@ struct Chunk {
 impl Chunk {
     pub fn new() -> Self {
         let now = Instant::now().elapsed().as_secs();
-        Self {
+        Chunk {
             created_at: now,
             is_finalized: false,
             owner: None
@@ -48,7 +48,7 @@ struct StorageDeal {
 
 impl StorageDeal {
     pub fn new(root_hash: Hash, chunk_hashes: Vec<Hash>) -> Self {        
-        Self {
+        StorageDeal {
             root_hash: root_hash,
             chunks: chunk_hashes
                 .into_iter()
@@ -62,17 +62,21 @@ impl StorageDeal {
     // }
 }
 
-struct State {
+struct Pipeline {
     pub active_storage_providers: HashMap<PeerId, StorageProviderHints>,
     pub storage_deals: HashMap<String, StorageDeal>,
 }
 
-impl State {
+impl Pipeline {
     pub fn new() -> Self {
-        State {
+        Pipeline {
             active_storage_providers: HashMap::new(),
             storage_deals: HashMap::new()
         }
+    }
+
+    pub fn assign(&mut self) {
+
     }
 }
 
@@ -89,7 +93,7 @@ pub async fn run(
     mut rx_handler: mpsc::Receiver<HandlerMessage>,
     tx_swarm: mpsc::Sender<SwarmMessage>
 ) -> Result<()> {
-    let mut state = State::new();
+    let mut pipeline = Pipeline::new();
     // remove stale storage providers every ~5 minutes
     const STORAGE_PROVIDER_DECAY: u64 = 5 * 60;
     let mut timer_stale_providers = IntervalStream::new(
@@ -100,7 +104,7 @@ pub async fn run(
             tokio::select! {
                 _i = timer_stale_providers.select_next_some() => {
                     let now = Instant::now().elapsed().as_secs();
-                    state
+                    pipeline
                         .active_storage_providers                                        
                         .retain(|_, v| {
                             v.created_at + STORAGE_PROVIDER_DECAY < now
@@ -115,10 +119,12 @@ pub async fn run(
                                 peer_id,
                                 capacity,
                             } => {
-                                state.active_storage_providers.insert(peer_id, StorageProviderHints {
-                                    capacity: capacity,
-                                    created_at: Instant::now().elapsed().as_secs()
-                                });
+                                pipeline
+                                    .active_storage_providers
+                                    .insert(peer_id, StorageProviderHints {
+                                        capacity: capacity,
+                                        created_at: Instant::now().elapsed().as_secs()
+                                    });
                             }
                             HandlerMessage::Request {
                                 peer_id,
@@ -149,14 +155,14 @@ pub async fn run(
                                 root_hash,
                                 chunk_hashes
                             } => {
-                                if state.storage_deals.contains_key(&id) {
+                                if pipeline.storage_deals.contains_key(&id) {
                                     warn!(
                                         "Ignored duplicate diffuse blob message for blob: `{}`",
                                         id
                                     );
                                     continue;
                                 }
-                                state.storage_deals.insert(id, StorageDeal::new(root_hash, chunk_hashes));
+                                pipeline.storage_deals.insert(id, StorageDeal::new(root_hash, chunk_hashes));
                                 // prepare for assignments
                             }
                         }
