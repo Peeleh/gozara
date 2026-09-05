@@ -24,14 +24,54 @@ struct StorageProviderHints {
     pub created_at: u64,
 }
 
+struct Chunk {
+    pub created_at: u64,
+    pub is_finalized: bool,
+    pub owner: Option<PeerId>,
+}
+
+impl Chunk {
+    pub fn new() -> Self {
+        let now = Instant::now().elapsed().as_secs();
+        Self {
+            created_at: now,
+            is_finalized: false,
+            owner: None
+        }
+    }
+}
+
+struct StorageDeal {
+    pub root_hash: Hash,
+    pub chunks: HashMap<Hash, Chunk>,
+}
+
+impl StorageDeal {
+    pub fn new(root_hash: Hash, chunk_hashes: Vec<Hash>) -> Self {        
+        Self {
+            root_hash: root_hash,
+            chunks: chunk_hashes
+                .into_iter()
+                .map(|h| (h, Chunk::new()))
+                .collect()
+        }
+    }
+
+    // pub fn is_finalized(&self) -> bool {
+    //     self.chunks.values().all(|v| *v == ChunkStatus::Finalized)
+    // }
+}
+
 struct State {
     pub active_storage_providers: HashMap<PeerId, StorageProviderHints>,
+    pub storage_deals: HashMap<String, StorageDeal>,
 }
 
 impl State {
     pub fn new() -> Self {
         State {
             active_storage_providers: HashMap::new(),
+            storage_deals: HashMap::new()
         }
     }
 }
@@ -40,7 +80,7 @@ pub enum CoordMessage {
     DiffuseBlob {
         id: String,
         root_hash: Hash,
-        num_chunks: usize,
+        chunk_hashes: Vec<Hash>,
     }
 }
 
@@ -107,8 +147,17 @@ pub async fn run(
                             CoordMessage::DiffuseBlob {
                                 id,
                                 root_hash,
-                                num_chunks
+                                chunk_hashes
                             } => {
+                                if state.storage_deals.contains_key(&id) {
+                                    warn!(
+                                        "Ignored duplicate diffuse blob message for blob: `{}`",
+                                        id
+                                    );
+                                    continue;
+                                }
+                                state.storage_deals.insert(id, StorageDeal::new(root_hash, chunk_hashes));
+                                // prepare for assignments
                             }
                         }
                     }

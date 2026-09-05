@@ -77,7 +77,9 @@ struct Blob {
     pub bridge_id: String,
     pub data: Bytes,
     // [<start, end>]
-    pub chunks: Vec<(usize, usize)>,
+    pub chunk_boundaries: Vec<(usize, usize)>,
+    pub chunk_hashes: Vec<Hash>,
+    pub merkle_tree: MerkleTree::<Blake3Hash>,
     pub created_at: u64,
 }
 
@@ -101,20 +103,18 @@ impl BlobStore {
         if 0 == data.len() {
             return Err(eyre!("Ignored empty blob."));
         }
-        let merkle_tree = {
-            let leaves: Vec<Hash> = data
-                .chunks(CHUNK_SIZE)
-                .map(|c| blake3::hash(c).into())
-                .collect();
-            MerkleTree::<Blake3Hash>::from_leaves(&leaves)
-        };
+        let leaves: Vec<Hash> = data
+            .chunks(CHUNK_SIZE)
+            .map(|c| blake3::hash(c).into())
+            .collect();
+        let merkle_tree = MerkleTree::<Blake3Hash>::from_leaves(&leaves);
         let root_hash = merkle_tree
             .root()
             .ok_or(eyre!("Couldn't get the merkle root."))?;
         if self.blobs.contains_key(&id) {
             return Err(eyre!("Duplicate blob: {}", hex::encode(root_hash)));
         }        
-        let chunks: Vec<(usize, usize)> = (0..data.len())            
+        let chunk_boundaries: Vec<(usize, usize)> = (0..data.len())            
             .step_by(CHUNK_SIZE)
             .map(|start| {
                 let end = (start + CHUNK_SIZE).min(data.len());
@@ -132,7 +132,9 @@ impl BlobStore {
                 root_hash: root_hash,
                 bridge_id: id,
                 data: data,
-                chunks: chunks,
+                chunk_boundaries: chunk_boundaries,
+                chunk_hashes: leaves,
+                merkle_tree: merkle_tree,
                 created_at: Instant::now().elapsed().as_secs()
             }
         );
@@ -189,7 +191,7 @@ async fn start_blob_store(
                                         if let Err(e) = tx_coord.send(CoordMessage::DiffuseBlob {
                                             id: id.clone(),
                                             root_hash: blob.root_hash,
-                                            num_chunks: blob.chunks.len()
+                                            chunk_hashes: blob.chunk_hashes.clone()
                                         }).await {
                                             warn!(
                                                 "Failed to send diffuse message to the coordinator's channel: {}",
@@ -200,7 +202,12 @@ async fn start_blob_store(
                                                 UploadStatus::Failed{ reason: e.to_string() }
                                             );
                                             // todo: retry
+                                            continue;
                                         }
+                                        bridge_state.upload_status_map.insert(
+                                            id,
+                                            UploadStatus::Pending
+                                        );
                                     }
                                     Err(e) => {
                                         warn!("Store blob error: {}", e);
@@ -264,7 +271,6 @@ async fn new_blob(
         );
         return StatusCode::INTERNAL_SERVER_ERROR
     }
-    state.upload_status_map.insert(id, UploadStatus::Pending);
     StatusCode::CREATED
 }
 
