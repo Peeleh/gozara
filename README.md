@@ -1,6 +1,4 @@
-## Gozara
-
-`گذرا`
+## Gozara `گذرا`
 
 is a Persian word meaning ephemeral. It's romanized as `Gozara` and is pronounced `gɜːzæra`. 
 
