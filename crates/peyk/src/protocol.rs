@@ -1,20 +1,16 @@
 use serde::{Deserialize, Serialize};
+use libp2p::PeerId;
 
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
-    RequestStoragePermit {
-        id: String,
-        chunks: Vec<[u8; 32]>,        
-    },    
+    RequestStoragePermit,
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
-    StoragePermit {
-        id: String,
-        // none means rejection
-        valid_until: Option<u64>,
+    // convention: each ACK is worth ~20 chunks(up to 100mb) of storage space
+    AckStoragePermit {
+        valid_until: u64
     },
 }

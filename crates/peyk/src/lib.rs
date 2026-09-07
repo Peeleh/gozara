@@ -26,14 +26,15 @@ use tokio_stream::wrappers::IntervalStream;
 use p2p::{GlobalBehaviour, GlobalBehaviourEvent};
 
 pub enum SwarmMessage {
-    PersistBlob { id: String }
+    RequestStoragePermits { 
+        peers: Vec<PeerId>,
+    }
 }
 
 // consumers handle inbound messages
 pub enum HandlerMessage {
     WouldStore {
         peer_id: PeerId, 
-        capacity: u32,
     },
     Request {
         peer_id: PeerId,
@@ -75,13 +76,24 @@ pub async fn process_swarm(
                 r = rx.recv() =>  match r {
                     Some(sw_req) => {
                         match sw_req {
-                            SwarmMessage::PersistBlob { id: _id } => {
+                            SwarmMessage::RequestStoragePermits { 
+                                peers
+                            } => {
+                            for peer in peers.iter() {
+                                let _ = swarm
+                                    .behaviour_mut()
+                                    .req_resp
+                                    .send_request(
+                                        peer,
+                                        protocol::Request::RequestStoragePermit
+                                    );
+                                }                                
                             }
                         }
                     }
                     None => {
                         warn!("Swarm channel is closed.");
-                        break;
+                        continue
                     }
                 },                
                 
@@ -143,11 +155,10 @@ pub async fn process_swarm(
                         message,
                         ..
                     })) => {
-                        match bincode::deserialize::<u32>(&message.data) {
-                            Ok(capacity) => {
+                        match bincode::deserialize::<u8>(&message.data) {
+                            Ok(_) => {
                                 if let Err(e) = tx_handler.send(HandlerMessage::WouldStore {
                                     peer_id: peer_id,
-                                    capacity: capacity
                                 }).await {
                                     warn!(
                                         "Gossip notify error: `{:?}`",
@@ -220,7 +231,7 @@ pub async fn process_swarm(
                             channel: channel
                         }).await {
                             warn!(
-                                "Request notify error: `{:?}`",
+                                "Request relay error: `{:?}`",
                                 e
                             );                                    
                         }
@@ -240,7 +251,7 @@ pub async fn process_swarm(
                             response: response
                         }).await {
                             warn!(
-                                "Response notify error: `{:?}`",
+                                "Response relay error: `{:?}`",
                                 e
                             );                                    
                         }
