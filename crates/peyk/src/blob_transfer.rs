@@ -1,3 +1,4 @@
+// source is mostly AI(Gemini) generated content
 use std::{
     io,
     sync::OnceLock
