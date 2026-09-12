@@ -40,13 +40,13 @@ pub fn new_progress_bar(size: u64) -> ProgressBar {
 #[derive(Debug, Clone)]
 pub struct BlobCodec;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Request(
     // param: blob hash
     pub String
 ); 
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Response(
     // param: blob data
     pub Vec<u8>

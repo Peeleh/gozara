@@ -8,7 +8,7 @@ use tracing::{info, warn};
 use serde::Serialize;
 use futures::stream::StreamExt;
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     time::interval
 };
 use axum::{
@@ -34,15 +34,17 @@ const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const RETENTION_TIME: u64 = 4 * 60 * 60;
 
 pub enum BlobMessage {
-    // comes from the bridge
+    // src: the bridge
     Store {
         id: String,
         data: Bytes
-    },
-    // comes from the swarm
-    Persist {
+    },    
+    // src: the coordinator
+    // to transfer chunk bytes
+    FetchChunks {
         id: String,
-        result: bool
+        chunks: Vec<Hash>,
+        tx: oneshot::Sender<Option<HashMap<Hash, Option<Bytes>>>>,
     }
 }
 
@@ -76,9 +78,7 @@ struct Blob {
     pub root_hash: Hash,
     pub bridge_id: String,
     pub data: Bytes,
-    // [<start, end>]
-    pub chunk_boundaries: Vec<(usize, usize)>,
-    pub chunk_hashes: Vec<Hash>,
+    pub chunks: HashMap<Hash, Bytes>,
     pub merkle_tree: MerkleTree::<Blake3Hash>,
     pub created_at: u64,
 }
@@ -100,27 +100,22 @@ impl BlobStore {
         id: String,
         data: Bytes,
     ) -> Result<()> {
-        if 0 == data.len() {
-            return Err(eyre!("Ignored empty blob."));
+        if data.is_empty() {
+            return Err(eyre!("Empty blob."));
         }
-        let leaves: Vec<Hash> = data
+        if self.blobs.contains_key(&id) {
+            return Err(eyre!("Duplicate blob: {}", id));
+        }        
+        let chunks: HashMap<Hash, Bytes> = data
             .chunks(CHUNK_SIZE)
-            .map(|c| blake3::hash(c).into())
+            .map(|c| (blake3::hash(c).into(), data.slice_ref(c)))
             .collect();
-        let merkle_tree = MerkleTree::<Blake3Hash>::from_leaves(&leaves);
+        let merkle_tree = MerkleTree::<Blake3Hash>::from_leaves(
+            &chunks.keys().cloned().collect::<Vec<Hash>>()
+        );
         let root_hash = merkle_tree
             .root()
-            .ok_or(eyre!("Couldn't get the merkle root."))?;
-        if self.blobs.contains_key(&id) {
-            return Err(eyre!("Duplicate blob: {}", hex::encode(root_hash)));
-        }        
-        let chunk_boundaries: Vec<(usize, usize)> = (0..data.len())            
-            .step_by(CHUNK_SIZE)
-            .map(|start| {
-                let end = (start + CHUNK_SIZE).min(data.len());
-                (start, end)
-            })
-            .collect();
+            .ok_or(eyre!("Couldn't get the merkle root."))?;        
         info!(
             "Blob `{}` is cuhnked and now stored locally with root hash(`{}`). We'll now try to persist it globally.",
             id,
@@ -132,8 +127,7 @@ impl BlobStore {
                 root_hash: root_hash,
                 bridge_id: id,
                 data: data,
-                chunk_boundaries: chunk_boundaries,
-                chunk_hashes: leaves,
+                chunks: chunks,
                 merkle_tree: merkle_tree,
                 created_at: Instant::now().elapsed().as_secs()
             }
@@ -188,13 +182,13 @@ async fn start_blob_store(
                                     Ok(_) => {
                                         let blob = blob_store.blobs.get(&id).unwrap();
                                         // time to send it out baby
-                                        if let Err(e) = tx_coord.send(CoordMessage::DiffuseBlob {
+                                        if let Err(e) = tx_coord.send(CoordMessage::DistributeBlob {
                                             id: id.clone(),
                                             root_hash: blob.root_hash,
-                                            chunk_hashes: blob.chunk_hashes.clone()
+                                            chunk_hashes: blob.chunks.keys().cloned().collect()
                                         }).await {
                                             warn!(
-                                                "Failed to send diffuse message to the coordinator's channel: {}",
+                                                "Failed to send distribute message to the coordinator's channel: {}",
                                                 e
                                             );
                                             bridge_state.upload_status_map.insert(
@@ -221,7 +215,31 @@ async fn start_blob_store(
 
                                 }                                
                             }
-                            BlobMessage::Persist{id: _, result: _} => {}
+                            BlobMessage::FetchChunks {
+                                id: id,
+                                chunks: requested_chunks,
+                                tx: tx
+                            } => {
+                                let Some(blob) = blob_store.blobs.get(&id) else {
+                                    if tx.send(None).is_err() {
+                                        warn!(
+                                            "Failed to notify the coordinator about the missing blob(`{}`).",
+                                            id,
+                                        );
+                                    }
+                                    continue
+                                };
+                                let chunks: HashMap<Hash, Option<Bytes>> = requested_chunks
+                                    .iter()
+                                    .map(|h| (*h, blob.chunks.get(h).cloned()))
+                                    .collect();                                
+                                if tx.send(Some(chunks)).is_err() {
+                                    warn!(
+                                        "Failed to send chunks of the blob(`{}`) to the coordinator,",
+                                        id,
+                                    );
+                                }                               
+                            }
                         }
                     }
                     None => {
@@ -292,11 +310,12 @@ async fn serve_bridge(
 }
 
 pub async fn run(
+    tx_blob: mpsc::Sender<BlobMessage>,
+    rx_blob: mpsc::Receiver<BlobMessage>,
     tx_coord: mpsc::Sender<CoordMessage>
 ) -> Result<()> {
-    let (tx, rx) = mpsc::channel::<BlobMessage>(4);
-    let bridge_state = BridgeState::new(tx);
-    start_blob_store(rx, tx_coord, bridge_state.clone()).await?;
+    let bridge_state = BridgeState::new(tx_blob);
+    start_blob_store(rx_blob, tx_coord, bridge_state.clone()).await?;
     serve_bridge(bridge_state).await?;
     Ok(())
 }

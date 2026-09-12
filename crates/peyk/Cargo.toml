@@ -23,3 +23,4 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true
 bincode.workspace = true
+bytes.workspace = true

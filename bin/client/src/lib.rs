@@ -125,8 +125,9 @@ pub async fn run(
     let (tx_swarm, rx_swarm) = mpsc::channel::<peyk::SwarmMessage>(16);
     let (tx_handler, rx_handler) = mpsc::channel::<peyk::HandlerMessage>(256);
     let (tx_coord, rx_coord) = mpsc::channel::<coordinator::CoordMessage>(256);
+    let (tx_blob, rx_blob) = mpsc::channel::<blob_store::BlobMessage>(4);
     peyk::process_swarm(swarm, rx_swarm, tx_handler).await?; 
-    coordinator::run(rx_coord, rx_handler, tx_swarm).await?;
-    blob_store::run(tx_coord).await?;
+    coordinator::run(rx_coord, rx_handler, tx_swarm, tx_blob.clone()).await?;
+    blob_store::run(tx_blob, rx_blob, tx_coord).await?;
     Ok(())
 }

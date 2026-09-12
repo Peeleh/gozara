@@ -2,7 +2,10 @@ pub mod p2p;
 pub mod protocol;
 pub mod blob_transfer;
 
-use std::time::Duration;
+use std::{
+    time::Duration,
+    collections::HashMap
+};
 use futures::stream::StreamExt;
 use eyre::Result;
 use tracing::{info, warn};
@@ -23,12 +26,16 @@ use tokio::{
     time::interval
 };
 use tokio_stream::wrappers::IntervalStream;
+use bytes::Bytes;
 use p2p::{GlobalBehaviour, GlobalBehaviourEvent};
 
 pub enum SwarmMessage {
     RequestStoragePermits { 
         peers: Vec<PeerId>,
-    }
+    },
+    Store {
+        chunks: HashMap<PeerId, Vec<([u8; 32], Bytes)>>,
+    }    
 }
 
 // consumers handle inbound messages
@@ -79,15 +86,21 @@ pub async fn process_swarm(
                             SwarmMessage::RequestStoragePermits { 
                                 peers
                             } => {
-                            for peer in peers.iter() {
-                                let _ = swarm
-                                    .behaviour_mut()
-                                    .req_resp
-                                    .send_request(
-                                        peer,
-                                        protocol::Request::RequestStoragePermit
-                                    );
-                                }                                
+                                for peer in peers.iter() {
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .req_resp
+                                        .send_request(
+                                            peer,
+                                            protocol::Request::RequestStoragePermit
+                                        );
+                                }
+                            }
+                            SwarmMessage::Store {
+                                chunks,
+                            } => {
+                                // chunks: HashMap<PeerId, Vec<(Hash, Bytes)>>,                                
+                                
                             }
                         }
                     }
@@ -99,7 +112,6 @@ pub async fn process_swarm(
                 
                 // libp2p events
                 event = swarm.select_next_some() => match event {
-                    // general events
                     SwarmEvent::NewListenAddr { address, .. } => {
                         info!("Local node is listening on {address}");
                     }
@@ -114,7 +126,7 @@ pub async fn process_swarm(
                             endpoint
                         );                    
                     }
-                    // identify events
+                    // <identify>
                     SwarmEvent::Behaviour(GlobalBehaviourEvent::Identify(identify::Event::Received {
                         // peer_id,
                         // info,
@@ -149,7 +161,7 @@ pub async fn process_swarm(
                                 .add_address(&peer_id, address);
                         }                      
                     }
-                    // gossipsub events
+                    // <gossipsub>
                     SwarmEvent::Behaviour(GlobalBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                         propagation_source: peer_id,
                         message,
@@ -174,7 +186,7 @@ pub async fn process_swarm(
                             }
                         }
                     }
-                    // kademlia events
+                    // <kademlia>
                     SwarmEvent::Behaviour(GlobalBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
                         result: kad::QueryResult::GetClosestPeers(Ok(_ok)),
                         ..
@@ -206,7 +218,7 @@ pub async fn process_swarm(
                     //     }
                     // },
 
-                    // requests
+                    // <protocol>
                     SwarmEvent::Behaviour(GlobalBehaviourEvent::ReqResp(request_response::Event::Message {
                         peer: peer_id,
                         message: request_response::Message::Request {
@@ -256,6 +268,89 @@ pub async fn process_swarm(
                             );                                    
                         }
                     }
+                    // <blob transfer>
+                    // SwarmEvent::Behaviour(GlobalBehaviourEvent::BlobTransfer(request_response::Event::Message {
+                    //     peer: peer_id,
+                    //     message: request_response::Message::Request {
+                    //         request: blob_transfer::Request(blob_hash),
+                    //         channel,
+                    //         //request_id,
+                    //         ..
+                    //     },
+                    //     ..
+                    // })) => {                
+                    //     let blob_hash = blob_hash.parse::<u128>().unwrap();
+                    //     if let Some(blob) = pipeline.get_blob(&blob_hash) {
+                    //         if let Err(e) = swarm
+                    //             .behaviour_mut()
+                    //             .blob_transfer
+                    //                 .send_response(
+                    //                     channel,
+                    //                     blob_transfer::Response(blob.clone())
+                    //                 )
+                    //         {
+                    //             warn!(
+                    //                 "Failed to initiate the requested blob(`{}`)'s transmission: `{:?}`.",
+                    //                 blob_hash,
+                    //                 e
+                    //             );
+                    //         } else {
+                    //             info!(
+                    //                 "The requested blob(`{}`)'s transmission to `{}` is initiated: {:.2} KB",
+                    //                 blob_hash,
+                    //                 peer_id,
+                    //                 blob.len() as f64 / 1024.0f64
+                    //             );
+                    //         }
+                    //     } else {
+                    //         warn!(
+                    //             "The requested blob(`{}`) does not exist.",
+                    //             blob_hash,
+                    //         );
+                    //     }
+                    // },
+
+                    // SwarmEvent::Behaviour(GlobalBehaviourEvent::BlobTransfer(request_response::Event::Message {
+                    //     peer: peer_id,
+                    //     message: request_response::Message::Response {
+                    //         response: blob_transfer::Response(blob),
+                    //         //response_id,
+                    //         ..
+                    //     },
+                    //     ..
+                    // })) => {
+                    //     pipeline.verify_agg_proof(blob, peer_id);
+                    // },
+
+                    // SwarmEvent::Behaviour(GlobalBehaviourEvent::BlobTransfer(request_response::Event::InboundFailure {
+                    //     peer: peer_id,
+                    //     connection_id,
+                    //     request_id,
+                    //     error,
+                    // })) => {
+                    //     warn!(
+                    //         "Blob transfer `inbound failure`: peer `{}`, con_id: {:?}, req_id: {:?}, e: {:?} ",
+                    //         peer_id,
+                    //         connection_id,
+                    //         request_id,
+                    //         error
+                    //     );
+                    // },
+
+                    // SwarmEvent::Behaviour(GlobalBehaviourEvent::BlobTransfer(request_response::Event::OutboundFailure {
+                    //     peer: peer_id,
+                    //     connection_id,
+                    //     request_id,
+                    //     error,
+                    // })) => {
+                    //     warn!(
+                    //         "Blob transfer `outbound failure`: peer `{}`, con_id: {:?}, req_id: {:?}, e: {:?} ",
+                    //         peer_id,
+                    //         connection_id,
+                    //         request_id,
+                    //         error
+                    //     );
+                    // },
                     _ => {
                         // info!("{:#?}", event);
                     }

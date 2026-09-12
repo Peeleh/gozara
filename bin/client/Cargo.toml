@@ -27,4 +27,6 @@ libp2p-quic.workspace = true
 blake3.workspace = true
 rs_merkle.workspace = true
 hex.workspace = true
+bytes.workspace = true
+rand.workspace = true
 peyk.workspace = true

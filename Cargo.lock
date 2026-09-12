@@ -553,6 +553,7 @@ dependencies = [
  "axum",
  "bincode",
  "blake3",
+ "bytes",
  "clap",
  "dashmap",
  "dotenv",
@@ -563,6 +564,7 @@ dependencies = [
  "libp2p-quic",
  "opentelemetry_sdk",
  "peyk",
+ "rand 0.10.2",
  "rs_merkle",
  "serde",
  "serde_json",
@@ -2509,6 +2511,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bincode",
+ "bytes",
  "eyre",
  "futures",
  "indicatif",

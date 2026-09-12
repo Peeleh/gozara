@@ -51,7 +51,7 @@ opentelemetry-appender-tracing = "0.4.0"
 opentelemetry-otlp = "0.16.0"
 opentelemetry_sdk = "0.23.0"
 # prost = "0.13.5"
-rand = "0.9.0"
+rand = "0.10.2"
 reqwest = "0.12.12"
 #rustix = { version = "0.38", features = ["fs"] }
 #rustls = { version = "0.23.27", features = ["ring"] }
