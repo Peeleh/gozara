@@ -216,9 +216,9 @@ async fn start_blob_store(
                                 }                                
                             }
                             BlobMessage::FetchChunks {
-                                id: id,
+                                id,
                                 chunks: requested_chunks,
-                                tx: tx
+                                tx
                             } => {
                                 let Some(blob) = blob_store.blobs.get(&id) else {
                                     if tx.send(None).is_err() {

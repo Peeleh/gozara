@@ -71,23 +71,6 @@ fn prepare_request_response_behaviour()
     )
 }
 
-// prepare blob-transfer behaviour
-fn prepare_blob_transfer_behaviour()
--> request_response::Behaviour::<blob_transfer::BlobCodec> 
-{
-    request_response::Behaviour::with_codec(
-        blob_transfer::BlobCodec,
-        [(
-            StreamProtocol::new("/gozara/blob_transfer/1.0"),
-            request_response::ProtocolSupport::Full,
-        )],
-        request_response::Config::default()
-            .with_request_timeout(
-                Duration::from_secs(60)
-            )
-    )
-}
-
 // prepare identify behaviour
 pub fn prepare_identify_behaviour(
     public_key: &identity::PublicKey
@@ -118,7 +101,7 @@ pub struct GlobalBehaviour {
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     pub gossipsub: gossipsub::Behaviour,
     pub req_resp: request_response::cbor::Behaviour<protocol::Request, protocol::Response>,
-    pub blob_transfer: request_response::Behaviour<blob_transfer::BlobCodec>,
+    pub blob_stream: libp2p_stream::Behaviour,
 }
 
 pub fn prepare_kademlia_behaviour(
@@ -154,10 +137,10 @@ pub fn setup_global_swarm(
                 kademlia: prepare_kademlia_behaviour(&public_key),
                 gossipsub: prepare_gossipsub_behaviour(&key)?,
                 req_resp: prepare_request_response_behaviour(),
-                blob_transfer: prepare_blob_transfer_behaviour()
+                blob_stream: libp2p_stream::Behaviour::new()
             })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-        .build();
+        .build();    
     Ok(swarm)
 }

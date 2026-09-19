@@ -14,6 +14,7 @@ use libp2p::{
 };
 use tokio::sync::mpsc;
 use libp2p::swarm::Swarm;
+use peyk::blob_transfer;
 
 pub struct Config {
     pub grpc_addr: String,
@@ -122,12 +123,20 @@ pub async fn run(
     config: Config,
 ) -> Result<()> {
     let swarm = go_public(config).await?;
+    let blob_transfer_control = swarm.behaviour().blob_stream.new_control();
     let (tx_swarm, rx_swarm) = mpsc::channel::<peyk::SwarmMessage>(16);
     let (tx_handler, rx_handler) = mpsc::channel::<peyk::HandlerMessage>(256);
     let (tx_coord, rx_coord) = mpsc::channel::<coordinator::CoordMessage>(256);
     let (tx_blob, rx_blob) = mpsc::channel::<blob_store::BlobMessage>(4);
     peyk::process_swarm(swarm, rx_swarm, tx_handler).await?; 
-    coordinator::run(rx_coord, rx_handler, tx_swarm, tx_blob.clone()).await?;
+    coordinator::run(
+        tx_coord.clone(),
+        rx_coord,
+        rx_handler,
+        tx_swarm,
+        tx_blob.clone(),
+        blob_transfer_control,
+    ).await?;
     blob_store::run(tx_blob, rx_blob, tx_coord).await?;
     Ok(())
 }

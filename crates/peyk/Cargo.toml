@@ -16,11 +16,13 @@ futures.workspace = true
 libp2p.workspace = true
 libp2p-quic.workspace = true
 #libp2p-identify = "0.44.1"
+libp2p-stream.workspace = true
 eyre.workspace = true
-indicatif = { version = "0.18", features = ["tokio"] }
-async-trait.workspace = true
+# indicatif = { version = "0.18", features = ["tokio"] }
+# async-trait.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true
 bincode.workspace = true
 bytes.workspace = true
+blake3.workspace = true
