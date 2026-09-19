@@ -31,6 +31,21 @@ const UploadTimeout: u64 = 30;
 // provider are valid for 5 minutes
 const STORAGE_PROVIDER_DECAY: u64 = 5 * 60;
 
+pub enum CoordMessage {
+    DistributeBlob {
+        id: String,
+        root_hash: Hash,
+        chunk_hashes: Vec<Hash>,
+    }, 
+}
+
+enum InternalMessage {
+    UpdateChunkStatus {
+        hash: Hash,
+        new_status: ChunkUploadStatus
+    }
+}
+
 #[derive(Debug)]
 enum ChunkUploadStatus {
     Pending,
@@ -56,6 +71,7 @@ struct Pipeline {
     storage_permits: HashMap<PeerId, u64>,
     pending_storage_deals: VecDeque<StorageDeal>,
     active_storage_deal: Option<StorageDeal>,
+    tx_internal: mpsc::UnboundedSender<InternalMessage>,
     tx_swarm: mpsc::Sender<SwarmMessage>,
     tx_blob: mpsc::Sender<BlobMessage>,
     blob_transfer_control: libp2p_stream::Control,
@@ -63,13 +79,11 @@ struct Pipeline {
     // to gate i/o usage
     download_allowance: Arc<Semaphore>,
     upload_allowance: Arc<Semaphore>,
-    // self coordination
-    tx_coord: mpsc::Sender<CoordMessage>
 }
 
 impl Pipeline {
     pub fn new(
-        tx_coord: mpsc::Sender<CoordMessage>,
+        tx_internal: mpsc::UnboundedSender<InternalMessage>,
         tx_swarm: mpsc::Sender<SwarmMessage>,
         tx_blob: mpsc::Sender<BlobMessage>,
         blob_transfer_control: libp2p_stream::Control,
@@ -80,13 +94,13 @@ impl Pipeline {
             storage_permits: HashMap::new(),
             pending_storage_deals: VecDeque::new(),
             active_storage_deal: None,
+            tx_internal,
             tx_swarm,
             tx_blob,
             blob_transfer_control,
             tx_blob_transfer_events,
             download_allowance: Arc::new(Semaphore::new(32)), // 32 * 4 = 128 MiB of downloads
             upload_allowance: Arc::new(Semaphore::new(20)),   // 20 * 4 =  80 MiB of uploads
-            tx_coord
         }
     }
 
@@ -229,24 +243,28 @@ impl Pipeline {
                         let upload_allowance = self.upload_allowance.clone();
                         let tx_events = self.tx_blob_transfer_events.clone();
                         // self send for maintenance and state propagation
-                        let tx_coord = self.tx_coord.clone();
+                        let tx_internal = self.tx_internal.clone();
                         tokio::spawn(async move {
                             if let Err(e) = upload_allowance.acquire_owned().await {
-                                warn!("Could not get allowance from the semaphore to begin upload.");
+                                warn!(
+                                    "Could not get allowance from the semaphore to begin upload: {:?}",
+                                    e
+                                );
                                 return
                             }
                             let hash_str = hex::encode(hash);
                             // upload initiated
-                            if let Err(e) = tx_coord.send(CoordMessage::UpdateChunkStatus {
+                            if let Err(e) = tx_internal.send(InternalMessage::UpdateChunkStatus {
                                 hash,
                                 new_status: ChunkUploadStatus::Inflight {
                                     created_at: Instant::now().elapsed().as_secs(),
                                     to: peer.clone()
                                 }
-                            }).await {
+                            }) {
                                 warn!(
-                                    "Could not notify the coordinator about an inflight upload for chunk(`{}`)",
-                                    hash_str
+                                    "Could not notify the coordinator about an inflight upload for chunk(`{}`): {:?}",
+                                    hash_str,
+                                    e
                                 );
                             }
                             if let Err(e) = blob_transfer::push(
@@ -270,16 +288,17 @@ impl Pipeline {
                                 hash_str,
                                 peer
                             );
-                            if let Err(e) = tx_coord.send(CoordMessage::UpdateChunkStatus {
+                            if let Err(e) = tx_internal.send(InternalMessage::UpdateChunkStatus {
                                 hash,
                                 new_status: ChunkUploadStatus::Finalized {
                                     on: Instant::now().elapsed().as_secs(),
                                     owner: peer.clone()
                                 }
-                            }).await {
+                            }) {
                                 warn!(
-                                    "Could not notify the coordinator about an completed upload for chunk(`{}`)",
-                                    hash_str
+                                    "Could not notify the coordinator about an completed upload for chunk(`{}`): {:?}",
+                                    hash_str,
+                                    e
                                 );
                             }                            
                         });
@@ -294,20 +313,7 @@ impl Pipeline {
     }
 }
 
-pub enum CoordMessage {
-    DistributeBlob {
-        id: String,
-        root_hash: Hash,
-        chunk_hashes: Vec<Hash>,
-    },
-    UpdateChunkStatus {
-        hash: Hash,
-        new_status: ChunkUploadStatus
-    }
-}
-
 pub async fn run(
-    tx_coord: mpsc::Sender<CoordMessage>,
     mut rx_coord: mpsc::Receiver<CoordMessage>,
     mut rx_handler: mpsc::Receiver<HandlerMessage>,
     tx_swarm: mpsc::Sender<SwarmMessage>,
@@ -324,9 +330,9 @@ pub async fn run(
     );
     let (tx_blob_transfer_events, mut rx_blob_transfer_event) = 
         mpsc::unbounded_channel::<blob_transfer::TransferEvent>();
-
+    let (tx_internal, mut rx_internal) = mpsc::unbounded_channel::<InternalMessage>();
     let mut pipeline = Pipeline::new(
-        tx_coord,
+        tx_internal,
         tx_swarm,
         tx_blob,
         blob_transfer_control,
@@ -407,7 +413,18 @@ pub async fn run(
                                     // todo: retry with backoff
                                 }
                             }
-                            CoordMessage::UpdateChunkStatus {
+                        }
+                    }
+                    None => {
+                        warn!("Coordination channel is closed.");
+                        break;
+                    }
+                },
+                // internal message
+                im = rx_internal.recv() => match im {
+                    Some(i_msg) => {
+                        match i_msg {                            
+                            InternalMessage::UpdateChunkStatus {
                                 hash,
                                 new_status
                             } => {
@@ -428,13 +445,22 @@ pub async fn run(
                                     );
                                     continue
                                 };
+                                match new_status {
+                                    ChunkUploadStatus::Pending | ChunkUploadStatus::Inflight { .. } => (),
+                                    ChunkUploadStatus::Finalized {
+                                        on,
+                                        owner
+                                    } => {
+
+                                    }                                    
+                                };
                                 *chunk_status = new_status;
                                 // todo: propagate the finalized state to http bridge
                             }
                         }
                     }
                     None => {
-                        warn!("Coordination channel is closed.");
+                        warn!("Internal channel is closed.");
                         break;
                     }
                 },
