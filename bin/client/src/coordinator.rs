@@ -290,6 +290,7 @@ impl Pipeline {
                                     e
                                 );
                                 // keep it at inflight to simulate backoff
+                                return
                             }
                             // upload succeeded
                             info!(
