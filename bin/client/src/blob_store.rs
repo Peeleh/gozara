@@ -33,12 +33,15 @@ const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 // blob lifetime: 4 hours
 const RETENTION_TIME: u64 = 4 * 60 * 60;
 
-pub enum BlobMessage {
+enum InternalMessage {
     // src: the bridge
-    Store {
+    NewBlob {
         id: String,
         data: Bytes,
-    },    
+    }
+}
+
+pub enum BlobMessage {
     // src: the coordinator
     // to transfer chunk bytes
     FetchChunks {
@@ -69,14 +72,14 @@ enum UploadStatus {
 #[derive(Clone)]
 struct BridgeState {
     upload_status_map: Arc<DashMap<String, UploadStatus>>,
-    blob_store_tx: mpsc::Sender<BlobMessage>,
+    internal_tx: mpsc::Sender<InternalMessage>
 }
 
 impl BridgeState {
-    pub fn new(blob_tx: mpsc::Sender<BlobMessage>) -> Self {
+    pub fn new(blob_tx: mpsc::Sender<InternalMessage>) -> Self {
         BridgeState {
             upload_status_map: Arc::new(DashMap::new()),
-            blob_store_tx: blob_tx
+            internal_tx: internal_tx
         }
     }
 }
@@ -164,6 +167,7 @@ impl BlobStore {
 }
 
 async fn start_blob_store(
+    mut rx_internal: mpsc::Receiver<InternalMessage>,
     mut rx_blob: mpsc::Receiver<BlobMessage>,
     tx_coord: mpsc::Sender<CoordMessage>,
     bridge_state: BridgeState,
@@ -179,37 +183,22 @@ async fn start_blob_store(
                 _i = timer_stale_blobs.select_next_some() => {                
                     blob_store.remove_stale_blobs(bridge_state.clone());
                 },
-                                
+
                 m = rx_blob.recv() =>  match m {
-                    Some(bm) => {
-                        match bm {
-                            BlobMessage::Store{id, data} => {
-                                match blob_store.store_blob(id.clone(), data) {
-                                    Ok(_) => {
-                                        let blob = blob_store.blobs.get(&id).unwrap();
-                                        if let Err(e) = tx_coord.send(CoordMessage::DistributeBlob {
-                                            id: id.clone(),
-                                            root_hash: blob.root_hash,
-                                            chunk_hashes: blob.chunks.keys().cloned().collect()
-                                        }).await {
-                                            warn!(
-                                                "Failed to send distribute message to the coordinator's channel: {}",
-                                                e
-                                            );
-                                            bridge_state.upload_status_map.insert(
-                                                id,
-                                                UploadStatus::Failed{ reason: Some(e.to_string()) }
-                                            );
-                                            // todo: retry
-                                            continue
-                                        }
-                                        bridge_state.upload_status_map.insert(
-                                            id,
-                                            UploadStatus::Pending
+                    Some(im) => match im {
+                        InternalMessage::NewBlob{ id, data } => {
+                            match blob_store.store_blob(id.clone(), data) {
+                                Ok(_) => {
+                                    let blob = blob_store.blobs.get(&id).unwrap();
+                                    if let Err(e) = tx_coord.send(CoordMessage::DistributeBlob {
+                                        id: id.clone(),
+                                        root_hash: blob.root_hash,
+                                        chunk_hashes: blob.chunks.keys().cloned().collect()
+                                    }).await {
+                                        warn!(
+                                            "Failed to send distribute message to the coordinator's channel: {}",
+                                            e
                                         );
-                                    }
-                                    Err(e) => {
-                                        warn!("Store blob error: {}", e);
                                         bridge_state.upload_status_map.insert(
                                             id,
                                             UploadStatus::Failed{ reason: Some(e.to_string()) }
@@ -217,88 +206,110 @@ async fn start_blob_store(
                                         // todo: retry
                                         continue
                                     }
-
-                                }                                
-                            }
-                            BlobMessage::FetchChunks {
-                                id,
-                                chunks: requested_chunks,
-                                tx
-                            } => {
-                                let Some(blob) = blob_store.blobs.get(&id) else {
-                                    if let Err(e) = tx.send(None) {
-                                        warn!(
-                                            "Failed to notify the coordinator about the missing blob(`{}`): {:?}",
-                                            id,
-                                            e
-                                        );
-                                    }
+                                    bridge_state.upload_status_map.insert(
+                                        id,
+                                        UploadStatus::Pending
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("Store blob error: {}", e);
+                                    bridge_state.upload_status_map.insert(
+                                        id,
+                                        UploadStatus::Failed{ reason: Some(e.to_string()) }
+                                    );
+                                    // todo: retry
                                     continue
-                                };
-                                let chunks: HashMap<Hash, Option<Bytes>> = requested_chunks
-                                    .iter()
-                                    .map(|h| (*h, blob.chunks.get(h).cloned()))
-                                    .collect();                                
-                                if let Err(e) = tx.send(Some(chunks)) {
+                                }
+
+                            }                                
+                        }
+                    }
+                    None => {
+                        warn!("Internal channel is closed.");
+                        break
+                    }
+                },
+                                
+                m = rx_blob.recv() =>  match m {
+                    Some(bm) => match bm {
+                        BlobMessage::FetchChunks {
+                            id,
+                            chunks: requested_chunks,
+                            tx
+                        } => {
+                            let Some(blob) = blob_store.blobs.get(&id) else {
+                                if let Err(e) = tx.send(None) {
                                     warn!(
-                                        "Failed to send chunks of the blob(`{}`) to the coordinator: {:?}",
+                                        "Failed to notify the coordinator about the missing blob(`{}`): {:?}",
                                         id,
                                         e
                                     );
-                                }                               
-                            }
-                            BlobMessage::StoreResult {
-                                id,
-                                success,
-                                failure_reason
-                            } => {
-                                let Some(blob) = blob_store.blobs.get(&id) else {
-                                    warn!(
-                                        "Invalid blob(`{}`) store result `{}`.",
-                                        id,
-                                        success
-                                    );
-                                    continue
-                                };
-                                if success {
-                                    {
-                                        let Some(mut status) = bridge_state.upload_status_map.get_mut(&id) else {
-                                            warn!(
-                                                "Missing blob(`{}`) to update its status(`success`).",
-                                                id
-                                            );
-                                            continue
-                                        };
-                                        *status = UploadStatus::Finalized;
-                                    }
-                                    info!(
-                                        "Blob(`{}`) is now stored globally.",
-                                        id
-                                    );
-                                    // todo: inform the bridge
-                                } else {
-                                    {
-                                        let Some(mut status) = bridge_state.upload_status_map.get_mut(&id) else {
-                                            warn!(
-                                                "Missing blob(`{}`) to update its status(`failed`).",
-                                                id
-                                            );
-                                            continue
-                                        };
-                                        *status = UploadStatus::Failed { reason: failure_reason.clone() };
-                                    }
-                                    info!(
-                                        "Failed to store blob(`{}`) globally, reason: {}.",
-                                        id,
-                                        if let Some(r) = failure_reason { r } else { "not provided".to_string() }
-                                    );                                    
                                 }
+                                continue
+                            };
+                            let chunks: HashMap<Hash, Option<Bytes>> = requested_chunks
+                                .iter()
+                                .map(|h| (*h, blob.chunks.get(h).cloned()))
+                                .collect();                                
+                            if let Err(e) = tx.send(Some(chunks)) {
+                                warn!(
+                                    "Failed to send chunks of the blob(`{}`) to the coordinator: {:?}",
+                                    id,
+                                    e
+                                );
+                            }                               
+                        }
+                        BlobMessage::StoreResult {
+                            id,
+                            success,
+                            failure_reason
+                        } => {
+                            let Some(blob) = blob_store.blobs.get(&id) else {
+                                warn!(
+                                    "Invalid blob(`{}`) store result `{}`.",
+                                    id,
+                                    success
+                                );
+                                continue
+                            };
+                            if success {
+                                {
+                                    let Some(mut status) = bridge_state.upload_status_map.get_mut(&id) else {
+                                        warn!(
+                                            "Missing blob(`{}`) to update its status(`success`).",
+                                            id
+                                        );
+                                        continue
+                                    };
+                                    *status = UploadStatus::Finalized;
+                                }
+                                info!(
+                                    "Blob(`{}`) is now stored globally.",
+                                    id
+                                );
+                                // todo: inform the bridge
+                            } else {
+                                {
+                                    let Some(mut status) = bridge_state.upload_status_map.get_mut(&id) else {
+                                        warn!(
+                                            "Missing blob(`{}`) to update its status(`failed`).",
+                                            id
+                                        );
+                                        continue
+                                    };
+                                    *status = UploadStatus::Failed { reason: failure_reason.clone() };
+                                }
+                                info!(
+                                    "Failed to store blob(`{}`) globally, reason: {}.",
+                                    id,
+                                    if let Some(r) = failure_reason { r } else { "not provided".to_string() }
+                                );                                    
                             }
                         }
                     }
                     None => {
-                        warn!("Store blob channel is closed.");
-                        break;
+                        warn!("Blob channel is closed.");
+                        break
                     }
                 }
             }
@@ -368,8 +379,9 @@ pub async fn run(
     rx_blob: mpsc::Receiver<BlobMessage>,
     tx_coord: mpsc::Sender<CoordMessage>
 ) -> Result<()> {
-    let bridge_state = BridgeState::new(tx_blob);
-    start_blob_store(rx_blob, tx_coord, bridge_state.clone()).await?;
+    let (tx_internal, rx_internal) = mpsc::channel::<InternalMessage>(32);
+    let bridge_state = BridgeState::new(tx_internal);
+    start_blob_store(rx_internal, rx_blob, tx_coord, bridge_state.clone()).await?;
     serve_bridge(bridge_state).await?;
     Ok(())
 }
