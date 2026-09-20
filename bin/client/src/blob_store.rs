@@ -37,7 +37,7 @@ pub enum BlobMessage {
     // src: the bridge
     Store {
         id: String,
-        data: Bytes
+        data: Bytes,
     },    
     // src: the coordinator
     // to transfer chunk bytes
@@ -45,10 +45,17 @@ pub enum BlobMessage {
         id: String,
         chunks: Vec<Hash>,
         tx: oneshot::Sender<Option<HashMap<Hash, Option<Bytes>>>>,
+    },
+    // src: the coordinator
+    // to notify about blob distribution result
+    StoreResult {
+        id: String,
+        success: bool,
+        failure_reason: Option<String>,
     }
 }
 
-// 1 GB
+// 1 GiB
 const MAX_BLOB_SIZE: usize = 1 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Serialize)]
@@ -56,7 +63,7 @@ const MAX_BLOB_SIZE: usize = 1 * 1024 * 1024 * 1024;
 enum UploadStatus {
     Pending,
     Finalized,
-    Failed { reason: String },
+    Failed { reason: Option<String> },
 }
 
 #[derive(Clone)]
@@ -161,13 +168,12 @@ async fn start_blob_store(
     tx_coord: mpsc::Sender<CoordMessage>,
     bridge_state: BridgeState,
 ) -> Result<()> {
-    let mut blob_store = BlobStore::new();        
+    let mut blob_store = BlobStore::new();
     // to remove stale blobs
     let mut timer_stale_blobs = IntervalStream::new(
         interval(Duration::from_secs(60))
     ).fuse();
     tokio::spawn(async move {
-
         loop {
             tokio::select! {
                 _i = timer_stale_blobs.select_next_some() => {                
@@ -181,7 +187,6 @@ async fn start_blob_store(
                                 match blob_store.store_blob(id.clone(), data) {
                                     Ok(_) => {
                                         let blob = blob_store.blobs.get(&id).unwrap();
-                                        // time to send it out baby
                                         if let Err(e) = tx_coord.send(CoordMessage::DistributeBlob {
                                             id: id.clone(),
                                             root_hash: blob.root_hash,
@@ -193,10 +198,10 @@ async fn start_blob_store(
                                             );
                                             bridge_state.upload_status_map.insert(
                                                 id,
-                                                UploadStatus::Failed{ reason: e.to_string() }
+                                                UploadStatus::Failed{ reason: Some(e.to_string()) }
                                             );
                                             // todo: retry
-                                            continue;
+                                            continue
                                         }
                                         bridge_state.upload_status_map.insert(
                                             id,
@@ -207,10 +212,10 @@ async fn start_blob_store(
                                         warn!("Store blob error: {}", e);
                                         bridge_state.upload_status_map.insert(
                                             id,
-                                            UploadStatus::Failed{ reason: e.to_string() }
+                                            UploadStatus::Failed{ reason: Some(e.to_string()) }
                                         );
                                         // todo: retry
-                                        continue;                                        
+                                        continue
                                     }
 
                                 }                                
@@ -221,10 +226,11 @@ async fn start_blob_store(
                                 tx
                             } => {
                                 let Some(blob) = blob_store.blobs.get(&id) else {
-                                    if tx.send(None).is_err() {
+                                    if let Err(e) = tx.send(None) {
                                         warn!(
-                                            "Failed to notify the coordinator about the missing blob(`{}`).",
+                                            "Failed to notify the coordinator about the missing blob(`{}`): {:?}",
                                             id,
+                                            e
                                         );
                                     }
                                     continue
@@ -233,12 +239,60 @@ async fn start_blob_store(
                                     .iter()
                                     .map(|h| (*h, blob.chunks.get(h).cloned()))
                                     .collect();                                
-                                if tx.send(Some(chunks)).is_err() {
+                                if let Err(e) = tx.send(Some(chunks)) {
                                     warn!(
-                                        "Failed to send chunks of the blob(`{}`) to the coordinator,",
+                                        "Failed to send chunks of the blob(`{}`) to the coordinator: {:?}",
                                         id,
+                                        e
                                     );
                                 }                               
+                            }
+                            BlobMessage::StoreResult {
+                                id,
+                                success,
+                                failure_reason
+                            } => {
+                                let Some(blob) = blob_store.blobs.get(&id) else {
+                                    warn!(
+                                        "Invalid blob(`{}`) store result `{}`.",
+                                        id,
+                                        success
+                                    );
+                                    continue
+                                };
+                                if success {
+                                    {
+                                        let Some(mut status) = bridge_state.upload_status_map.get_mut(&id) else {
+                                            warn!(
+                                                "Missing blob(`{}`) to update its status(`success`).",
+                                                id
+                                            );
+                                            continue
+                                        };
+                                        *status = UploadStatus::Finalized;
+                                    }
+                                    info!(
+                                        "Blob(`{}`) is now stored globally.",
+                                        id
+                                    );
+                                    // todo: inform the bridge
+                                } else {
+                                    {
+                                        let Some(mut status) = bridge_state.upload_status_map.get_mut(&id) else {
+                                            warn!(
+                                                "Missing blob(`{}`) to update its status(`failed`).",
+                                                id
+                                            );
+                                            continue
+                                        };
+                                        *status = UploadStatus::Failed { reason: failure_reason.clone() };
+                                    }
+                                    info!(
+                                        "Failed to store blob(`{}`) globally, reason: {}.",
+                                        id,
+                                        if let Some(r) = failure_reason { r } else { "not provided".to_string() }
+                                    );                                    
+                                }
                             }
                         }
                     }
@@ -281,7 +335,7 @@ async fn new_blob(
         return StatusCode::INTERNAL_SERVER_ERROR
     }
     if let Err(e) = state.blob_store_tx.send(
-        BlobMessage::Store{id: id.clone(), data: body}
+        BlobMessage::Store{ id: id.clone(), data: body }
     ).await {
         warn!(
             "Failed to send blob to the blob center: `{:?}`",

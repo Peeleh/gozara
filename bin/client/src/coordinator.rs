@@ -11,7 +11,6 @@ use tokio::{
     time::interval
 };
 use tokio_stream::wrappers::IntervalStream;
-use dashmap::DashMap;
 use bytes::Bytes;
 use libp2p::{
     // identity,
@@ -27,7 +26,7 @@ use peyk::{HandlerMessage, SwarmMessage};
 // max blob size 8 MiB
 const MAX_BLOB_SIZE: usize = 8 * 1024 * 1024;
 // 30 seconds
-const UploadTimeout: u64 = 30;
+const UPLOAD_TIMEOUT: u64 = 30;
 // provider are valid for 5 minutes
 const STORAGE_PROVIDER_DECAY: u64 = 5 * 60;
 
@@ -46,7 +45,7 @@ enum InternalMessage {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ChunkUploadStatus {
     Pending,
     Inflight {
@@ -63,6 +62,17 @@ struct StorageDeal {
     id: String,
     pub root_hash: Hash,
     pub chunks: HashMap<Hash, ChunkUploadStatus>,
+}
+
+impl StorageDeal {
+    pub fn is_finalized(&self) -> bool {
+        self.chunks
+            .values()
+            .all(|status| match *status {
+                ChunkUploadStatus::Finalized { .. } => true, 
+                _ => false
+            })
+    }
 }
 
 struct Pipeline {
@@ -110,7 +120,6 @@ impl Pipeline {
         root_hash: Hash,
         chunk_hashes: Vec<Hash>
     ) {
-        let now = Instant::now().elapsed().as_secs();
         self.pending_storage_deals.push_back(StorageDeal {
             id,
             root_hash: root_hash,
@@ -164,7 +173,7 @@ impl Pipeline {
                         ..
                     } => {
                         // timed out
-                        if created_at + UploadTimeout > now {
+                        if created_at + UPLOAD_TIMEOUT > now {
                             Some(*h)
                         } else {
                             None
@@ -334,7 +343,7 @@ pub async fn run(
     let mut pipeline = Pipeline::new(
         tx_internal,
         tx_swarm,
-        tx_blob,
+        tx_blob.clone(),
         blob_transfer_control,
         tx_blob_transfer_events
     );
@@ -423,7 +432,7 @@ pub async fn run(
                 // internal message
                 im = rx_internal.recv() => match im {
                     Some(i_msg) => {
-                        match i_msg {                            
+                        match i_msg {
                             InternalMessage::UpdateChunkStatus {
                                 hash,
                                 new_status
@@ -445,17 +454,35 @@ pub async fn run(
                                     );
                                     continue
                                 };
+                                // todo: check if the new status is > the older
+                                *chunk_status = new_status.clone();
                                 match new_status {
-                                    ChunkUploadStatus::Pending | ChunkUploadStatus::Inflight { .. } => (),
+                                    ChunkUploadStatus::Pending | ChunkUploadStatus::Inflight { .. } => {},
                                     ChunkUploadStatus::Finalized {
                                         on,
                                         owner
                                     } => {
-
-                                    }                                    
+                                        info!(
+                                            "Chunk(`{}`) is successfully upload to peer(`{}`).",
+                                            hash_str,
+                                            owner
+                                        );
+                                        if active_storage_deal.is_finalized() {
+                                            if let Err(e) = tx_blob.send(BlobMessage::StoreResult {
+                                                id: active_storage_deal.id.clone(),
+                                                success: true,
+                                                failure_reason: None
+                                            }).await {
+                                                warn!(
+                                                    "Failed to notify blob store about global storage finalization: {:?}.",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                        // todo: when to notify it about failure?
+                                    }
                                 };
-                                *chunk_status = new_status;
-                                // todo: propagate the finalized state to http bridge
+
                             }
                         }
                     }
