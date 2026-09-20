@@ -187,12 +187,11 @@ impl Pipeline {
             .into_iter()
             .take(self.upload_allowance.available_permits())
             .collect();
-        // todo: flatten and sample peers uniformly to reduce peers' bandwidth and avoid starvation
         let (tx, rx) = oneshot::channel::<Option<HashMap<Hash, Option<Bytes>>>>();
         if let Err(e) = self.tx_blob.send(BlobMessage::FetchChunks {
             id: active_storage_deal.id.clone(),
             chunks: chosen_chunks,
-            tx: tx,
+            tx_reply: tx,
         }).await {
             warn!(
                 "Failed to ask for chunks of blob(`{}`) from blob store: {}",

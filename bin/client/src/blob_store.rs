@@ -47,7 +47,7 @@ pub enum BlobMessage {
     FetchChunks {
         id: String,
         chunks: Vec<Hash>,
-        tx: oneshot::Sender<Option<HashMap<Hash, Option<Bytes>>>>,
+        tx_reply: oneshot::Sender<Option<HashMap<Hash, Option<Bytes>>>>,
     },
     // src: the coordinator
     // to notify about blob distribution result
@@ -235,10 +235,10 @@ async fn start_blob_store(
                         BlobMessage::FetchChunks {
                             id,
                             chunks: requested_chunks,
-                            tx
+                            tx_reply
                         } => {
                             let Some(blob) = blob_store.blobs.get(&id) else {
-                                if let Err(e) = tx.send(None) {
+                                if let Err(e) = tx_reply.send(None) {
                                     warn!(
                                         "Failed to notify the coordinator about the missing blob(`{}`): {:?}",
                                         id,
@@ -251,7 +251,7 @@ async fn start_blob_store(
                                 .iter()
                                 .map(|h| (*h, blob.chunks.get(h).cloned()))
                                 .collect();                                
-                            if let Err(e) = tx.send(Some(chunks)) {
+                            if let Err(e) = tx_reply.send(Some(chunks)) {
                                 warn!(
                                     "Failed to send chunks of the blob(`{}`) to the coordinator: {:?}",
                                     id,
