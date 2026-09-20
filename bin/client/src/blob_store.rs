@@ -72,14 +72,14 @@ enum UploadStatus {
 #[derive(Clone)]
 struct BridgeState {
     upload_status_map: Arc<DashMap<String, UploadStatus>>,
-    internal_tx: mpsc::Sender<InternalMessage>
+    tx_internal: mpsc::Sender<InternalMessage>
 }
 
 impl BridgeState {
-    pub fn new(blob_tx: mpsc::Sender<InternalMessage>) -> Self {
+    pub fn new(tx_internal: mpsc::Sender<InternalMessage>) -> Self {
         BridgeState {
             upload_status_map: Arc::new(DashMap::new()),
-            internal_tx: internal_tx
+            tx_internal: tx_internal
         }
     }
 }
@@ -184,9 +184,9 @@ async fn start_blob_store(
                     blob_store.remove_stale_blobs(bridge_state.clone());
                 },
 
-                m = rx_blob.recv() =>  match m {
+                m = rx_internal.recv() =>  match m {
                     Some(im) => match im {
-                        InternalMessage::NewBlob{ id, data } => {
+                        InternalMessage::NewBlob { id, data } => {
                             match blob_store.store_blob(id.clone(), data) {
                                 Ok(_) => {
                                     let blob = blob_store.blobs.get(&id).unwrap();
@@ -345,9 +345,11 @@ async fn new_blob(
         );
         return StatusCode::INTERNAL_SERVER_ERROR
     }
-    if let Err(e) = state.blob_store_tx.send(
-        BlobMessage::Store{ id: id.clone(), data: body }
-    ).await {
+    if let Err(e) = state.tx_internal.send(
+        InternalMessage::NewBlob {
+            id: id.clone(),
+            data: body
+    }).await {
         warn!(
             "Failed to send blob to the blob center: `{:?}`",
             e
