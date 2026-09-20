@@ -128,9 +128,7 @@ impl Pipeline {
                 .map(|h| (h, ChunkUploadStatus::Pending))
                 .collect()
         });
-        if self.active_storage_deal.is_none() {
-            self.active_storage_deal = self.pending_storage_deals.pop_front();
-        }        
+        self.begin_next_deal();
     }
 
     pub async fn request_storage_permits(&self)-> Result<()> {
@@ -144,6 +142,20 @@ impl Pipeline {
             }).await?;
         }
         Ok(())
+    }
+
+    pub fn begin_next_deal(&mut self) {
+        if self.active_storage_deal.is_none() {
+            self.active_storage_deal = self.pending_storage_deals.pop_front();
+            if let Some(deal) = self.active_storage_deal.as_ref() {
+                info!(
+                    "A new deal(`{}`) has begun.",
+                    deal.id
+                );
+            } else {
+                info!("All deals are caught up. Waiting for the next...");
+            }
+        }
     }
 
     pub async fn assign_chunks(&mut self) {
@@ -469,15 +481,19 @@ pub async fn run(
                                             owner
                                         );
                                         if active_storage_deal.is_finalized() {
-                                            if let Err(e) = tx_blob.send(BlobMessage::StoreResult {
+                                            match tx_blob.send(BlobMessage::StoreResult {
                                                 id: active_storage_deal.id.clone(),
                                                 success: true,
                                                 failure_reason: None
                                             }).await {
-                                                warn!(
-                                                    "Failed to notify blob store about global storage finalization: {:?}.",
-                                                    e
-                                                );
+                                                Ok(_) => {
+                                                    pipeline.begin_next_deal();
+                                                }
+                                                Err(e) => 
+                                                    warn!(
+                                                        "Failed to notify blob store about global storage finalization: {:?}.",
+                                                        e
+                                                    )
                                             }
                                         }
                                         // todo: when to notify it about failure?
