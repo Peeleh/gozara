@@ -132,10 +132,7 @@ impl BlobStore {
         let now = Instant::now();
         self.blobs.retain(|_, blob| {
             now.duration_since(blob.created_at).as_secs() < BLOB_LIFETIME
-        });
-        bridge_state.upload_status_map.retain(|k, _| {
-            self.blobs.contains_key(k)
-        });
+        });        
         // todo: inform the bridge?
     }
 }
