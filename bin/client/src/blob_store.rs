@@ -61,7 +61,7 @@ pub enum BlobMessage {
 struct Blob {
     root_hash: Hash,
     data: Bytes,
-    chunks: Vec<(Hash, Bytes)>,
+    chunks: HashMap<Hash, Bytes>,
     merkle_tree: MerkleTree::<Blake3Hash>,
     created_at: Instant,
 }
@@ -111,7 +111,7 @@ impl BlobStore {
             Blob {
                 root_hash,
                 data,
-                chunks,
+                chunks: chunks.into_iter().collect(),
                 merkle_tree,
                 created_at: Instant::now()
             }
@@ -162,21 +162,13 @@ fn start_blob_store(
                                     if let Err(e) = tx_coord.send(CoordMessage::DistributeBlob {
                                         id: id.clone(),
                                         root_hash: blob.root_hash,
-                                        chunk_hashes: blob
-                                            .chunks
-                                            .iter()
-                                            .map(|(hash, _)| *hash)
-                                            .collect()
+                                        chunk_hashes: blob.chunks.keys().cloned().collect()
                                     }).await {
                                         warn!(
                                             "Failed to send distribute message to the coordinator's channel: {}",
                                             e
                                         );
-                                        bridge_state.upload_status_map.insert(
-                                            id,
-                                            UploadStatus::Failed{ reason: Some(e.to_string()) }
-                                        );
-                                        // todo: retry
+                                        // todo: retry or it'll stay pending forever
                                         continue
                                     }
                                     bridge_state.upload_status_map.insert(
@@ -197,7 +189,7 @@ fn start_blob_store(
                                     continue
                                 }
 
-                            }                                
+                            }
                         }
                     }
                     None => {
@@ -223,27 +215,17 @@ fn start_blob_store(
                                 }
                                 continue
                             };
-                            let mut chunks: HashMap<Hash, Option<Bytes>> = HashMap::new();
-                            for hash in requested_chunks.into_iter() {
-                                chunks.insert(hash.clone(), blob
-                                    .chunks
-                                    .iter()
-                                    .find_map(|(item_hash, data)|
-                                        if hash == *item_hash {
-                                            Some(data.clone())
-                                        } else {
-                                            None
-                                        }
-                                    )
-                                );
-                            }
+                            let chunks: HashMap<Hash, Option<Bytes>> = requested_chunks
+                                .into_iter()
+                                .map(|hash| (hash, blob.chunks.get(&hash).cloned()))
+                                .collect();
                             if let Err(e) = tx_reply.send(Some(chunks)) {
                                 warn!(
                                     "Failed to send chunks of the blob(`{}`) to the coordinator: {:?}",
                                     id,
                                     e
                                 );
-                            }                               
+                            }
                         }
                         BlobMessage::StoreResult {
                             id,
