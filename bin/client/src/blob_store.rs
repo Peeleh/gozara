@@ -6,7 +6,7 @@ use std::{
 use eyre::{eyre, Result};
 use tracing::{info, warn};
 use serde::Serialize;
-use futures::stream::StreamExt;
+// use futures::stream::StreamExt;
 use tokio::{
     sync::{mpsc, oneshot},
     time::interval
@@ -20,7 +20,7 @@ use axum::{
     response::{Json, IntoResponse}
 };
 use dashmap::DashMap;
-use tokio_stream::wrappers::IntervalStream;
+// use tokio_stream::wrappers::IntervalStream;
 use rs_merkle::MerkleTree;
 use crate::coordinator::CoordMessage;
 use crate::blake3_wrapper::Blake3Hash;
@@ -150,13 +150,11 @@ fn start_blob_store(
 ) -> Result<()> {
     let mut blob_store = BlobStore::new();
     // to remove stale blobs
-    let mut timer_stale_blobs = IntervalStream::new(
-        interval(Duration::from_secs(60))
-    ).fuse();
+    let mut timer_stale_blobs = interval(Duration::from_secs(60));
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _i = timer_stale_blobs.select_next_some() => {                
+                _i = timer_stale_blobs.tick() => {
                     blob_store.remove_stale_blobs(bridge_state.clone());
                 },
 

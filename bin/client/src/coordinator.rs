@@ -5,12 +5,12 @@ use std::{
 };
 use eyre::{eyre, Result};
 use tracing::{info, warn};
-use futures::StreamExt;
+// use futures::StreamExt;
 use tokio::{
     sync::{mpsc, oneshot, Semaphore},
     time::interval
 };
-use tokio_stream::wrappers::IntervalStream;
+// use tokio_stream::wrappers::IntervalStream;
 use bytes::Bytes;
 use libp2p::{
     // identity,
@@ -360,16 +360,12 @@ pub async fn run(
         blob_transfer_control,
         tx_blob_transfer_events
     );
-    let mut timer_stale_providers = IntervalStream::new(
-        interval(Duration::from_secs(60))
-    ).fuse();
-    let mut timer_assign = IntervalStream::new(
-        interval(Duration::from_secs(30))
-    ).fuse();
+    let mut timer_stale_providers = interval(Duration::from_secs(60));
+    let mut timer_assign = interval(Duration::from_secs(30));
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _i = timer_stale_providers.select_next_some() => {
+                _i = timer_stale_providers.tick() => {
                     let now = Instant::now().elapsed().as_secs();
                     pipeline
                         .storage_provider_hints
@@ -377,7 +373,7 @@ pub async fn run(
                             *created_at + STORAGE_PROVIDER_DECAY < now
                         });                    
                 },
-                _i = timer_assign.select_next_some() => {
+                _i = timer_assign.tick() => {
                     pipeline.assign_chunks().await;                    
                 },
                 // swarm handlers
