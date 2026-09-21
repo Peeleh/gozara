@@ -60,7 +60,6 @@ pub enum BlobMessage {
 
 struct Blob {
     root_hash: Hash,
-    bridge_id: String,
     data: Bytes,
     chunks: Vec<(Hash, Bytes)>,
     merkle_tree: MerkleTree::<Blake3Hash>,
@@ -111,7 +110,6 @@ impl BlobStore {
             id.clone(), 
             Blob {
                 root_hash,
-                bridge_id: id,
                 data,
                 chunks,
                 merkle_tree,
