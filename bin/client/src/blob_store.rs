@@ -28,6 +28,7 @@ use crate::blake3_wrapper::Blake3Hash;
 
 pub type Hash = [u8; 32];
 
+
 // 4 MB
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
@@ -171,10 +172,6 @@ fn start_blob_store(
                                         // todo: retry or it'll stay pending forever
                                         continue
                                     }
-                                    bridge_state.upload_status_map.insert(
-                                        id,
-                                        UploadStatus::Pending
-                                    );
                                 }
                                 Err(e) => {
                                     warn!(
@@ -188,7 +185,6 @@ fn start_blob_store(
                                     // todo: retry
                                     continue
                                 }
-
                             }
                         }
                     }
@@ -332,6 +328,7 @@ async fn new_blob(
         id, 
         body.len() as f32 / 1_048_576f32
     );
+    // todo: this check should be a match and the pending, ... flow should be strictly scrutinized
     if state.upload_status_map.contains_key(&id) {
         warn!(
             "Ignored duplicate blob(`{}`).",
@@ -339,6 +336,7 @@ async fn new_blob(
         );
         return StatusCode::CONFLICT
     }
+    state.upload_status_map.insert(id.clone(), UploadStatus::Pending); 
 
     if let Err(e) = state.tx_internal.send(
         InternalMessage::NewBlob {
