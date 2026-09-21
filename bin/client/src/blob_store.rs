@@ -88,13 +88,12 @@ struct Blob {
     root_hash: Hash,
     bridge_id: String,
     data: Bytes,
-    chunks: HashMap<Hash, Bytes>,
+    chunks: Vec<(Hash, Bytes)>,
     merkle_tree: MerkleTree::<Blake3Hash>,
     created_at: Instant,
 }
 
 struct BlobStore {
-    // <root hash, blob>
     blobs: HashMap<String, Blob>,    
 }
 
@@ -105,7 +104,7 @@ impl BlobStore {
         }
     }
 
-    pub fn store_blob(
+    pub fn add_blob(
         &mut self,
         id: String,
         data: Bytes,
@@ -115,13 +114,16 @@ impl BlobStore {
         }
         if self.blobs.contains_key(&id) {
             return Err(eyre!("Duplicate blob: {}", id));
-        }        
-        let chunks: HashMap<Hash, Bytes> = data
+        }
+        let chunks: Vec<(Hash, Bytes)> = data
             .chunks(CHUNK_SIZE)
             .map(|c| (blake3::hash(c).into(), data.slice_ref(c)))
-            .collect();
+            .collect();        
         let merkle_tree = MerkleTree::<Blake3Hash>::from_leaves(
-            &chunks.keys().cloned().collect::<Vec<Hash>>()
+            &chunks
+                .iter()
+                .map(|(hash, _)| hash.clone())
+                .collect::<Vec<Hash>>()
         );
         let root_hash = merkle_tree
             .root()
@@ -156,8 +158,8 @@ impl BlobStore {
         bridge_state: BridgeState
     ) {
         let now = Instant::now();
-        self.blobs.retain(|_, v| {
-            now.duration_since(v.created_at).as_secs() < BLOB_LIFETIME
+        self.blobs.retain(|_, blob| {
+            now.duration_since(blob.created_at).as_secs() < BLOB_LIFETIME
         });
         bridge_state.upload_status_map.retain(|k, _| {
             self.blobs.contains_key(k)
@@ -187,13 +189,17 @@ async fn start_blob_store(
                 m = rx_internal.recv() =>  match m {
                     Some(im) => match im {
                         InternalMessage::NewBlob { id, data } => {
-                            match blob_store.store_blob(id.clone(), data) {
+                            match blob_store.add_blob(id.clone(), data) {
                                 Ok(_) => {
                                     let blob = blob_store.blobs.get(&id).unwrap();
                                     if let Err(e) = tx_coord.send(CoordMessage::DistributeBlob {
                                         id: id.clone(),
                                         root_hash: blob.root_hash,
-                                        chunk_hashes: blob.chunks.keys().cloned().collect()
+                                        chunk_hashes: blob
+                                            .chunks
+                                            .iter()
+                                            .map(|(hash, _)| *hash)
+                                            .collect()
                                     }).await {
                                         warn!(
                                             "Failed to send distribute message to the coordinator's channel: {}",
@@ -212,7 +218,10 @@ async fn start_blob_store(
                                     );
                                 }
                                 Err(e) => {
-                                    warn!("Store blob error: {}", e);
+                                    warn!(
+                                        "Store blob error: {}",
+                                        e
+                                    );
                                     bridge_state.upload_status_map.insert(
                                         id,
                                         UploadStatus::Failed{ reason: Some(e.to_string()) }
@@ -247,10 +256,20 @@ async fn start_blob_store(
                                 }
                                 continue
                             };
-                            let chunks: HashMap<Hash, Option<Bytes>> = requested_chunks
-                                .iter()
-                                .map(|h| (*h, blob.chunks.get(h).cloned()))
-                                .collect();                                
+                            let mut chunks: HashMap<Hash, Option<Bytes>> = HashMap::new();
+                            for hash in requested_chunks.into_iter() {
+                                chunks.insert(hash.clone(), blob
+                                    .chunks
+                                    .iter()
+                                    .find_map(|(item_hash, data)|
+                                        if hash == *item_hash {
+                                            Some(data.clone())
+                                        } else {
+                                            None
+                                        }
+                                    )
+                                );
+                            }
                             if let Err(e) = tx_reply.send(Some(chunks)) {
                                 warn!(
                                     "Failed to send chunks of the blob(`{}`) to the coordinator: {:?}",
@@ -264,9 +283,9 @@ async fn start_blob_store(
                             success,
                             failure_reason
                         } => {
-                            let Some(blob) = blob_store.blobs.get(&id) else {
+                            if !blob_store.blobs.contains_key(&id) {
                                 warn!(
-                                    "Invalid blob(`{}`) store result `{}`.",
+                                    "Unsolicited blob(`{}`) store result `{}`.",
                                     id,
                                     success
                                 );
