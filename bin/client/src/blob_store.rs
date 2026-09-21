@@ -306,7 +306,8 @@ async fn start_blob_store(
                                     "Blob(`{}`) is now stored globally.",
                                     id
                                 );
-                                // todo: inform the bridge
+                                blob_store.remove_blob(&id);
+                                // todo: how to guard against blob retransmission?
                             } else {
                                 {
                                     let Some(mut status) = bridge_state.upload_status_map.get_mut(&id) else {
@@ -362,7 +363,7 @@ async fn new_blob(
             "Ignored duplicate blob(`{}`).",
             id
         );
-        return StatusCode::INTERNAL_SERVER_ERROR
+        return StatusCode::CONFLICT
     }
     if let Err(e) = state.tx_internal.send(
         InternalMessage::NewBlob {
