@@ -58,32 +58,6 @@ pub enum BlobMessage {
     }
 }
 
-// 1 GiB
-const MAX_BLOB_SIZE: usize = 1 * 1024 * 1024 * 1024;
-
-#[derive(Clone, Serialize)]
-#[serde(tag = "upload_status", rename_all = "lowercase")]
-enum UploadStatus {
-    Pending,
-    Finalized,
-    Failed { reason: Option<String> },
-}
-
-#[derive(Clone)]
-struct BridgeState {
-    upload_status_map: Arc<DashMap<String, UploadStatus>>,
-    tx_internal: mpsc::Sender<InternalMessage>
-}
-
-impl BridgeState {
-    pub fn new(tx_internal: mpsc::Sender<InternalMessage>) -> Self {
-        BridgeState {
-            upload_status_map: Arc::new(DashMap::new()),
-            tx_internal: tx_internal
-        }
-    }
-}
-
 struct Blob {
     root_hash: Hash,
     bridge_id: String,
@@ -129,18 +103,18 @@ impl BlobStore {
             .root()
             .ok_or(eyre!("Couldn't get the merkle root."))?;        
         info!(
-            "Blob `{}` is cuhnked and now stored locally with root hash(`{}`). We'll now try to persist it globally.",
+            "Blob `{}` is chunked and now stored locally with root hash(`{}`). We'll now try to persist it globally.",
             id,
             hex::encode(root_hash)
         );
         self.blobs.insert(
             id.clone(), 
             Blob {
-                root_hash: root_hash,
+                root_hash,
                 bridge_id: id,
-                data: data,
-                chunks: chunks,
-                merkle_tree: merkle_tree,
+                data,
+                chunks,
+                merkle_tree,
                 created_at: Instant::now()
             }
         );
@@ -168,7 +142,7 @@ impl BlobStore {
     }
 }
 
-async fn start_blob_store(
+fn start_blob_store(
     mut rx_internal: mpsc::Receiver<InternalMessage>,
     mut rx_blob: mpsc::Receiver<BlobMessage>,
     tx_coord: mpsc::Sender<CoordMessage>,
@@ -338,6 +312,32 @@ async fn start_blob_store(
     Ok(())
 }
 
+// 1 GiB
+const MAX_BLOB_SIZE: usize = 1 * 1024 * 1024 * 1024;
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "upload_status", rename_all = "lowercase")]
+enum UploadStatus {
+    Pending,
+    Finalized,
+    Failed { reason: Option<String> },
+}
+
+#[derive(Clone)]
+struct BridgeState {
+    upload_status_map: Arc<DashMap<String, UploadStatus>>,
+    tx_internal: mpsc::Sender<InternalMessage>
+}
+
+impl BridgeState {
+    pub fn new(tx_internal: mpsc::Sender<InternalMessage>) -> Self {
+        BridgeState {
+            upload_status_map: Arc::new(DashMap::new()),
+            tx_internal
+        }
+    }
+}
+
 async fn get_status(
     State(state): State<BridgeState>,
     Path(id): Path<String>
@@ -365,6 +365,7 @@ async fn new_blob(
         );
         return StatusCode::CONFLICT
     }
+
     if let Err(e) = state.tx_internal.send(
         InternalMessage::NewBlob {
             id: id.clone(),
@@ -388,7 +389,7 @@ async fn serve_bridge(
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_BLOB_SIZE));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8709").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8709").await?;
     info!("Artifact store bridge is up and listening on port 8709.");        
     axum::serve(listener, app)
         // .with_graceful_shutdown(shutdown.cancelled_owned())
@@ -403,7 +404,7 @@ pub async fn run(
 ) -> Result<()> {
     let (tx_internal, rx_internal) = mpsc::channel::<InternalMessage>(32);
     let bridge_state = BridgeState::new(tx_internal);
-    start_blob_store(rx_internal, rx_blob, tx_coord, bridge_state.clone()).await?;
+    start_blob_store(rx_internal, rx_blob, tx_coord, bridge_state.clone())?;
     serve_bridge(bridge_state).await?;
     Ok(())
 }
