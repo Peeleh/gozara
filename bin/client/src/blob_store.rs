@@ -127,8 +127,7 @@ impl BlobStore {
 
     // periodic cleanup
     pub fn remove_stale_blobs(
-        &mut self,
-        bridge_state: BridgeState
+        &mut self
     ) {
         let now = Instant::now();
         self.blobs.retain(|_, blob| {
@@ -151,7 +150,7 @@ fn start_blob_store(
         loop {
             tokio::select! {
                 _i = timer_stale_blobs.tick() => {
-                    blob_store.remove_stale_blobs(bridge_state.clone());
+                    blob_store.remove_stale_blobs();
                 },
 
                 m = rx_internal.recv() =>  match m {
@@ -378,7 +377,7 @@ pub async fn run(
 ) -> Result<()> {
     let (tx_internal, rx_internal) = mpsc::channel::<InternalMessage>(32);
     let bridge_state = BridgeState::new(tx_internal);
-    let _jh = start_blob_store(rx_internal, rx_blob, tx_coord, bridge_state.clone()).await;
+    let _jh = start_blob_store(rx_internal, rx_blob, tx_coord, bridge_state.clone());
     serve_bridge(bridge_state).await?;
     Ok(())
 }
