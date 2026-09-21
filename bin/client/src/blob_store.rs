@@ -8,6 +8,7 @@ use tracing::{info, warn};
 use serde::Serialize;
 // use futures::stream::StreamExt;
 use tokio::{
+    task::JoinHandle,
     sync::{mpsc, oneshot},
     time::interval
 };
@@ -142,7 +143,7 @@ fn start_blob_store(
     mut rx_blob: mpsc::Receiver<BlobMessage>,
     tx_coord: mpsc::Sender<CoordMessage>,
     bridge_state: BridgeState,
-) -> Result<()> {
+) -> JoinHandle<()> {
     let mut blob_store = BlobStore::new();
     // to remove stale blobs
     let mut timer_stale_blobs = interval(Duration::from_secs(60));
@@ -283,8 +284,7 @@ fn start_blob_store(
                 }
             }
         }
-    });
-    Ok(())
+    })
 }
 
 // 1 GiB
@@ -373,13 +373,12 @@ async fn serve_bridge(
 }
 
 pub async fn run(
-    tx_blob: mpsc::Sender<BlobMessage>,
     rx_blob: mpsc::Receiver<BlobMessage>,
     tx_coord: mpsc::Sender<CoordMessage>
 ) -> Result<()> {
     let (tx_internal, rx_internal) = mpsc::channel::<InternalMessage>(32);
     let bridge_state = BridgeState::new(tx_internal);
-    start_blob_store(rx_internal, rx_blob, tx_coord, bridge_state.clone())?;
+    let _jh = start_blob_store(rx_internal, rx_blob, tx_coord, bridge_state.clone()).await;
     serve_bridge(bridge_state).await?;
     Ok(())
 }

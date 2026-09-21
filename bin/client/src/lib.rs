@@ -136,6 +136,6 @@ pub async fn run(
         tx_blob.clone(),
         blob_transfer_control,
     ).await?;
-    blob_store::run(tx_blob, rx_blob, tx_coord).await?;
+    blob_store::run(rx_blob, tx_coord).await?;
     Ok(())
 }
