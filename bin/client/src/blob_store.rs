@@ -31,7 +31,7 @@ pub type Hash = [u8; 32];
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 // blob lifetime: 4 hours
-const RETENTION_TIME: u64 = 4 * 60 * 60;
+const BLOB_LIFETIME: u64 = 4 * 60 * 60;
 
 enum InternalMessage {
     // src: the bridge
@@ -85,12 +85,12 @@ impl BridgeState {
 }
 
 struct Blob {
-    pub root_hash: Hash,
-    pub bridge_id: String,
-    pub data: Bytes,
-    pub chunks: HashMap<Hash, Bytes>,
-    pub merkle_tree: MerkleTree::<Blake3Hash>,
-    pub created_at: u64,
+    root_hash: Hash,
+    bridge_id: String,
+    data: Bytes,
+    chunks: HashMap<Hash, Bytes>,
+    merkle_tree: MerkleTree::<Blake3Hash>,
+    created_at: Instant,
 }
 
 struct BlobStore {
@@ -139,7 +139,7 @@ impl BlobStore {
                 data: data,
                 chunks: chunks,
                 merkle_tree: merkle_tree,
-                created_at: Instant::now().elapsed().as_secs()
+                created_at: Instant::now()
             }
         );
 
@@ -155,9 +155,9 @@ impl BlobStore {
         &mut self,
         bridge_state: BridgeState
     ) {
-        let now = Instant::now().elapsed().as_secs();
+        let now = Instant::now();
         self.blobs.retain(|_, v| {
-            v.created_at + RETENTION_TIME < now
+            now.duration_since(v.created_at).as_secs() < BLOB_LIFETIME
         });
         bridge_state.upload_status_map.retain(|k, _| {
             self.blobs.contains_key(k)
