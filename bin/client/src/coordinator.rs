@@ -10,7 +10,7 @@ use tokio::{
     time::interval
 };
 use bytes::Bytes;
-use libp2p::PeerId};
+use libp2p::PeerId;
 use rand::seq::IndexedRandom;
 use crate::blob_store::{Hash, BlobMessage} ;
 use crate::blob_transfer;
@@ -19,7 +19,7 @@ use peyk::{HandlerMessage, SwarmMessage};
 // max incoming(network) blob size 8 MiB
 const MAX_BLOB_SIZE: usize = 8 * 1024 * 1024;
 // 30 seconds
-const UPLOAD_TIMEOUT: u64 = 30;
+const CHUNK_UPLOAD_WINDOW: u64 = 30;
 // provider are valid for 5 minutes
 const STORAGE_PROVIDER_DECAY: u64 = 5 * 60;
 
@@ -42,7 +42,7 @@ enum InternalMessage {
 enum ChunkUploadStatus {
     Pending,
     Inflight {
-        created_at: u64,
+        created_at: Instant,
         to: PeerId,
     },
     Finalized {
@@ -70,8 +70,8 @@ impl StorageDeal {
 
 struct Pipeline {
     // record WouldStore gossips
-    storage_provider_hints: HashMap<PeerId, u64>,
-    storage_permits: HashMap<PeerId, u64>,
+    storage_provider_hints: HashMap<PeerId, Instant>,
+    storage_permits: HashMap<PeerId, Instant>,
     pending_storage_deals: VecDeque<StorageDeal>,
     active_storage_deal: Option<StorageDeal>,
     tx_internal: mpsc::UnboundedSender<InternalMessage>,
@@ -154,18 +154,17 @@ impl Pipeline {
     pub async fn assign_chunks(&mut self) {
         if self.active_storage_deal.is_none() || 0 == self.upload_allowance.available_permits() {
             return
-        }
-        let now = Instant::now().elapsed().as_secs();
+        }        
+        let now = Instant::now();
         self.storage_permits
-            .retain(|_, valid_until| {
-                *valid_until < now
+            .retain(|_, created_at| {
+                *created_at < now
             });
         if self.storage_permits.is_empty() {
             return
         }
         let peers: Vec<PeerId> = self.storage_permits.keys().cloned().collect();     
         // skip already finalized chunks
-        let now = Instant::now().elapsed().as_secs();
         let active_storage_deal = self.active_storage_deal.as_mut().unwrap();
         let pending_chunks: Vec<_> = active_storage_deal
             .chunks
@@ -178,7 +177,7 @@ impl Pipeline {
                         ..
                     } => {
                         // timed out
-                        if created_at + UPLOAD_TIMEOUT > now {
+                        if now.duration_since(*created_at).as_secs() > CHUNK_UPLOAD_WINDOW {
                             Some(*h)
                         } else {
                             None
@@ -271,7 +270,7 @@ impl Pipeline {
                             if let Err(e) = tx_internal.send(InternalMessage::UpdateChunkStatus {
                                 hash,
                                 new_status: ChunkUploadStatus::Inflight {
-                                    created_at: Instant::now().elapsed().as_secs(),
+                                    created_at: Instant::now(),
                                     to: peer.clone()
                                 }
                             }) {
@@ -359,11 +358,10 @@ pub async fn run(
         loop {
             tokio::select! {
                 _i = timer_stale_providers.tick() => {
-                    let now = Instant::now().elapsed().as_secs();
                     pipeline
                         .storage_provider_hints
                         .retain(|_, created_at| {
-                            *created_at + STORAGE_PROVIDER_DECAY < now
+                            Instant::now().duration_since(*created_at).as_secs() < STORAGE_PROVIDER_DECAY
                         });                    
                 },
                 _i = timer_assign.tick() => {
@@ -379,7 +377,7 @@ pub async fn run(
                             } => {
                                 pipeline
                                     .storage_provider_hints
-                                    .insert(peer_id, Instant::now().elapsed().as_secs());
+                                    .insert(peer_id, Instant::now());
                             }
                             HandlerMessage::Request {
                                 peer_id,
@@ -394,8 +392,13 @@ pub async fn run(
                                 response
                             } => {
                                 match response {
-                                    peyk::protocol::Response::AckStoragePermit { valid_until } => {
-                                        pipeline.storage_permits.insert(peer_id.clone(), valid_until);
+                                    peyk::protocol::Response::AckStoragePermit { valid_for } => {
+                                        pipeline.storage_permits.insert(
+                                            peer_id.clone(),
+                                            Instant::now().checked_add(
+                                                Duration::from_secs(valid_for as u64)
+                                            ).unwrap()
+                                        );
                                     }
                                 }
                             }    

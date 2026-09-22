@@ -11,6 +11,6 @@ pub enum Request {
 pub enum Response {
     // convention: each ACK is worth ~20 chunks(up to 100mb) of storage space
     AckStoragePermit {
-        valid_until: u64
+        valid_for: u8
     },
 }
