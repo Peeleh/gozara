@@ -5,25 +5,18 @@ use std::{
 };
 use eyre::{eyre, Result};
 use tracing::{info, warn};
-// use futures::StreamExt;
 use tokio::{
     sync::{mpsc, oneshot, Semaphore},
     time::interval
 };
-// use tokio_stream::wrappers::IntervalStream;
 use bytes::Bytes;
-use libp2p::{
-    // identity,
-    // gossipsub,
-    // swarm::Swarm,
-    PeerId,
-};
+use libp2p::PeerId};
 use rand::seq::IndexedRandom;
 use crate::blob_store::{Hash, BlobMessage} ;
 use crate::blob_transfer;
 use peyk::{HandlerMessage, SwarmMessage};
 
-// max blob size 8 MiB
+// max incoming(network) blob size 8 MiB
 const MAX_BLOB_SIZE: usize = 8 * 1024 * 1024;
 // 30 seconds
 const UPLOAD_TIMEOUT: u64 = 30;
