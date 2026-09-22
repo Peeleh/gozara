@@ -53,18 +53,15 @@ enum ChunkUploadStatus {
 
 struct StorageDeal {
     id: String,
-    pub root_hash: Hash,
-    pub chunks: HashMap<Hash, ChunkUploadStatus>,
+    root_hash: Hash,
+    chunks: HashMap<Hash, ChunkUploadStatus>,
 }
 
 impl StorageDeal {
     pub fn is_finalized(&self) -> bool {
         self.chunks
             .values()
-            .all(|status| match *status {
-                ChunkUploadStatus::Finalized { .. } => true, 
-                _ => false
-            })
+            .all(|status| matches!(*status, ChunkUploadStatus::Finalized { .. }))
     }
 }
 
@@ -115,7 +112,7 @@ impl Pipeline {
     ) {
         self.pending_storage_deals.push_back(StorageDeal {
             id,
-            root_hash: root_hash,
+            root_hash,
             chunks: chunk_hashes
                 .into_iter()
                 .map(|h| (h, ChunkUploadStatus::Pending))
@@ -208,7 +205,7 @@ impl Pipeline {
         match rx.await {
             Ok(r) => {
                 let Some(chunks) = r else {
-                    warn!("Chunks are empty!");
+                    warn!("No chunks are available.");
                     return
                 };
                 // todo: cry about `none` chunks
@@ -217,7 +214,7 @@ impl Pipeline {
                     .filter_map(|(h, b)| if b.is_some() { Some((h, b.unwrap())) } else { None })
                     .collect();
                 if chunks.is_empty() {
-                    warn!("Chunks are empty!");
+                    warn!("Critical to assignment: requested chunks are missing.");
                     return
                 }
                 let num_chunks = chunks.len();
@@ -225,7 +222,7 @@ impl Pipeline {
                 let assignments: HashMap<PeerId, Vec<(Hash, Bytes)>> = if num_chunks >= num_peers {
                     let bucket_size = num_chunks / num_peers;
                     let buckets = chunks
-                        .chunks(bucket_size as usize)
+                        .chunks(bucket_size)
                         .into_iter()
                         .map(|t| t.into())
                         .collect::<Vec<Vec<(Hash, Bytes)>>>();
@@ -243,7 +240,7 @@ impl Pipeline {
                         .sample(&mut rng, num_chunks)
                         .into_iter()
                         .cloned()
-                        .zip(chunks.into_iter().collect::<Vec<_>>())
+                        .zip(chunks)
                         .collect()
                 };
                 // upload chunks                 
@@ -351,7 +348,7 @@ pub async fn run(
     );
     let mut timer_stale_providers = interval(Duration::from_secs(60));
     let mut timer_assign = interval(Duration::from_secs(30));
-    tokio::spawn(async move {
+    let jh = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _i = timer_stale_providers.tick() => {
@@ -530,5 +527,5 @@ pub async fn run(
             }
         }
     });
-    Ok(())
+    jh.await.map_err(|e| eyre!(e.to_string()))
 }
