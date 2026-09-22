@@ -286,8 +286,8 @@ fn start_blob_store(
 
 // 1 GiB
 const MAX_BLOB_SIZE: usize = 1 * 1024 * 1024 * 1024;
-// 12 GiB or max 12 new blob requests to the http bridge
-const TOTAL_INBOUND_BLOB_PRESSURE: usize = 12;
+// 8 GiB or max 8 new blob requests to the http bridge
+const TOTAL_INBOUND_BLOB_PRESSURE: usize = 8;
 
 #[derive(Clone, Serialize)]
 #[serde(tag = "upload_status", rename_all = "lowercase")]
