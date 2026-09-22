@@ -14,7 +14,6 @@ dotenv.workspace = true
 eyre.workspace = true
 opentelemetry_sdk.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
 tokio-util.workspace = true
 dashmap.workspace = true
 axum.workspace = true

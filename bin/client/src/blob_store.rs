@@ -6,7 +6,6 @@ use std::{
 use eyre::{eyre, Result};
 use tracing::{info, warn};
 use serde::Serialize;
-// use futures::stream::StreamExt;
 use tokio::{
     task::JoinHandle,
     sync::{mpsc, oneshot},
@@ -21,7 +20,6 @@ use axum::{
     response::{Json, IntoResponse}
 };
 use dashmap::DashMap;
-// use tokio_stream::wrappers::IntervalStream;
 use rs_merkle::MerkleTree;
 use crate::coordinator::CoordMessage;
 use crate::blake3_wrapper::Blake3Hash;
