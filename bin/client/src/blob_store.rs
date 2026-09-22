@@ -19,7 +19,10 @@ use axum::{
     Router,
     response::{Json, IntoResponse}
 };
-use dashmap::DashMap;
+use dashmap::{
+    DashMap,
+    mapref::entry::Entry
+};
 use rs_merkle::MerkleTree;
 use crate::coordinator::CoordMessage;
 use crate::blake3_wrapper::Blake3Hash;
@@ -327,14 +330,18 @@ async fn new_blob(
         body.len() as f32 / 1_048_576f32
     );
     // todo: this check should be a match and the pending, ... flow should be strictly scrutinized
-    if state.upload_status_map.contains_key(&id) {
-        warn!(
-            "Ignored duplicate blob(`{}`).",
-            id
-        );
-        return StatusCode::CONFLICT
+    match state.upload_status_map.entry(id.clone()) {
+        Entry::Occupied(_) => {
+            warn!(
+                "Ignored duplicate blob(`{}`).",
+                id
+            );
+            return StatusCode::CONFLICT
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(UploadStatus::Pending);
+        }
     }
-    state.upload_status_map.insert(id.clone(), UploadStatus::Pending); 
 
     if let Err(e) = state.tx_internal.send(
         InternalMessage::NewBlob {
