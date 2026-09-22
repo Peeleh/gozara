@@ -100,7 +100,7 @@ impl BlobStore {
         );
         let root_hash = merkle_tree
             .root()
-            .ok_or(eyre!("Couldn't get the merkle root."))?;        
+            .ok_or_else(|| eyre!("Couldn't get the merkle root."))?;        
         info!(
             "Blob `{}` is chunked and now stored locally with root hash(`{}`). We'll now try to persist it globally.",
             id,
