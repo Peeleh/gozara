@@ -19,6 +19,7 @@ use axum::{
     Router,
     response::{Json, IntoResponse}
 };
+use tower::limit::ConcurrencyLimitLayer;
 use dashmap::{
     DashMap,
     mapref::entry::Entry
@@ -285,6 +286,8 @@ fn start_blob_store(
 
 // 1 GiB
 const MAX_BLOB_SIZE: usize = 1 * 1024 * 1024 * 1024;
+// 12 GiB or max 12 new blob requests to the http bridge
+const TOTAL_INBOUND_BLOB_PRESSURE: usize = 12;
 
 #[derive(Clone, Serialize)]
 #[serde(tag = "upload_status", rename_all = "lowercase")]
@@ -362,7 +365,7 @@ async fn serve_bridge(
 ) -> Result<()> {    
     let app = Router::new()
         .route("/status/{id}", get(get_status))   
-        .route("/blob/{id}", post(new_blob))
+        .route("/blob/{id}", post(new_blob).layer(ConcurrencyLimitLayer::new(TOTAL_INBOUND_BLOB_PRESSURE)))
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_BLOB_SIZE));
 
@@ -378,7 +381,7 @@ pub async fn run(
     rx_blob: mpsc::Receiver<BlobMessage>,
     tx_coord: mpsc::Sender<CoordMessage>
 ) -> Result<()> {
-    let (tx_internal, rx_internal) = mpsc::channel::<InternalMessage>(32);
+    let (tx_internal, rx_internal) = mpsc::channel::<InternalMessage>(4);
     let bridge_state = BridgeState::new(tx_internal);
     let _jh = start_blob_store(rx_internal, rx_blob, tx_coord, bridge_state.clone());
     serve_bridge(bridge_state).await?;
