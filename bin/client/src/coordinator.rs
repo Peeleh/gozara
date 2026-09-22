@@ -390,12 +390,14 @@ pub async fn run(
                             } => {
                                 match response {
                                     peyk::protocol::Response::AckStoragePermit { valid_for } => {
+                                        let now = Instant::now();
                                         pipeline.storage_permits.insert(
                                             peer_id.clone(),
                                             Instant::now().checked_add(
                                                 Duration::from_secs(valid_for as u64)
-                                            ).unwrap()
+                                            ).unwrap_or_else(|| now)
                                         );
+                                        // todo: storage permit is already invalid
                                     }
                                 }
                             }    
@@ -504,6 +506,7 @@ pub async fn run(
                         // push.peer, push.data
                     },
                     None => {
+                        break
                     }
                 },
                 // pulls
@@ -512,11 +515,17 @@ pub async fn run(
                         // g.respond(store.get(&g.hash).await);
                     },
                     None => {
+                        break
                     }
                 },
                 // events
-                e = rx_blob_transfer_event.recv() => {
-                    info!("{:?}", e);
+                e = rx_blob_transfer_event.recv() => match e {
+                    Some(a) => {
+                        info!("{:?}", a);
+                    }
+                    None => {
+                        break
+                    }
                 },
             }
         }
