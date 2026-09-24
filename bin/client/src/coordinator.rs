@@ -46,7 +46,7 @@ enum ChunkUploadStatus {
         to: PeerId,
     },
     Finalized {
-        on: u64,
+        at: Instant,
         owner: PeerId
     }
 }
@@ -288,7 +288,7 @@ impl Pipeline {
                             if let Err(e) = tx_internal.send(InternalMessage::UpdateChunkStatus {
                                 hash,
                                 new_status: ChunkUploadStatus::Finalized {
-                                    on: Instant::now().elapsed().as_secs(),
+                                    at: Instant::now(),
                                     owner: peer.clone()
                                 }
                             }) {
@@ -449,7 +449,7 @@ pub async fn run(
                                 match new_status {
                                     ChunkUploadStatus::Pending | ChunkUploadStatus::Inflight { .. } => {},
                                     ChunkUploadStatus::Finalized {
-                                        on,
+                                        at,
                                         owner
                                     } => {
                                         info!(
