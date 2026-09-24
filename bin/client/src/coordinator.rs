@@ -11,7 +11,6 @@ use tokio::{
 };
 use bytes::Bytes;
 use libp2p::PeerId;
-use rand::seq::IndexedRandom;
 use crate::blob_store::{Hash, BlobMessage} ;
 use crate::blob_transfer;
 use peyk::{HandlerMessage, SwarmMessage};
@@ -20,7 +19,7 @@ use peyk::{HandlerMessage, SwarmMessage};
 const MAX_BLOB_SIZE: usize = 8 * 1024 * 1024;
 // 30 seconds
 const CHUNK_UPLOAD_WINDOW: u64 = 30;
-// provider are valid for 5 minutes
+// provider hints are valid for 5 minutes
 const STORAGE_PROVIDER_DECAY: u64 = 5 * 60;
 
 pub enum CoordMessage {
@@ -104,7 +103,7 @@ impl Pipeline {
         }
     }
 
-    pub fn new_deal(
+    pub async fn add_new_deal(
         &mut self,
         id: String,
         root_hash: Hash,
@@ -118,23 +117,36 @@ impl Pipeline {
                 .map(|h| (h, ChunkUploadStatus::Pending))
                 .collect()
         });
-        self.begin_next_deal();
+        self.begin_next_deal().await;
     }
 
-    pub async fn request_storage_permits(&self)-> Result<()> {
+    pub async fn request_storage_permits(&mut self) {
         if self.storage_provider_hints.is_empty() {
-            return Err(eyre!("No storage providers to request permits from."))
+            warn!("No storage providers to request permits from.");
+            return
         }
-        if self.active_storage_deal.is_some() {
-            // todo: peers size should not be large
-            self.tx_swarm.send(SwarmMessage::RequestStoragePermits {
-                peers: self.storage_provider_hints.keys().cloned().collect()
-            }).await?;
+        let now = Instant::now();
+        self.storage_permits.retain(|_, expires_at| *expires_at > now);
+        if !self.storage_permits.is_empty() {
+            warn!("Have got some storage permits for now. So, no more requests are sent.");
+            // todo: check if there are enough permits
+            return
         }
-        Ok(())
+        // todo: peers size should not be large
+        if let Err(e) = self.tx_swarm.send(SwarmMessage::RequestStoragePermits {
+            peers: self.storage_provider_hints.keys().cloned().collect()
+        }).await {
+            warn!(
+                "Failed to request a fresh storage permits: {:?}",
+                e
+            );
+            // todo: retry with backoff
+        } else {
+            info!("Requested a fresh storage permit for the active deal.");
+        }
     }
 
-    pub fn begin_next_deal(&mut self) {
+    pub async fn begin_next_deal(&mut self) {
         if self.active_storage_deal.is_none() {
             self.active_storage_deal = self.pending_storage_deals.pop_front();
             if let Some(deal) = self.active_storage_deal.as_ref() {
@@ -142,6 +154,7 @@ impl Pipeline {
                     "A new deal(`{}`) has begun.",
                     deal.id
                 );
+                self.request_storage_permits().await;
             } else {
                 info!("All deals are caught up. Waiting for the next...");
             }
@@ -149,14 +162,14 @@ impl Pipeline {
     }
 
     pub async fn assign_chunks(&mut self) {
-        if self.active_storage_deal.is_none() || 0 == self.upload_allowance.available_permits() {
-            return
-        }        
-        let now = Instant::now();
-        self.storage_permits.retain(|_, expires_at| *expires_at > now);
-        if self.storage_permits.is_empty() {
+        if self.active_storage_deal.is_none() {
             return
         }
+        if self.upload_allowance.available_permits() == 0 {
+            warn!("No upload allowance for now. So cannot proceed with chunk assignment.");
+            return
+        }
+        let now = Instant::now();
         let peers: Vec<PeerId> = self.storage_permits.keys().cloned().collect();
         // skip already finalized chunks
         let active_storage_deal = self.active_storage_deal.as_mut().unwrap();
@@ -345,7 +358,10 @@ pub async fn run(
                         .storage_provider_hints
                         .retain(|_, created_at| {
                             Instant::now().duration_since(*created_at).as_secs() < STORAGE_PROVIDER_DECAY
-                        });                    
+                        });
+                    if pipeline.active_storage_deal.is_some() {
+                        pipeline.request_storage_permits().await;
+                    }
                 },
                 _i = timer_assign.tick() => {
                     pipeline.assign_chunks().await;                    
@@ -379,7 +395,7 @@ pub async fn run(
                                         let now = Instant::now();
                                         pipeline.storage_permits.insert(
                                             peer_id.clone(),
-                                            Instant::now().checked_add(
+                                            now.checked_add(
                                                 Duration::from_secs(valid_for as u64)
                                             ).unwrap_or_else(|| now)
                                         );
@@ -403,14 +419,7 @@ pub async fn run(
                                 root_hash,
                                 chunk_hashes
                             } => {              
-                                pipeline.new_deal(id, root_hash, chunk_hashes);
-                                if let Err(e) = pipeline.request_storage_permits().await {
-                                    warn!(
-                                        "Request storage permit failed: {}",
-                                        e
-                                    );
-                                    // todo: retry with backoff
-                                }
+                                pipeline.add_new_deal(id, root_hash, chunk_hashes).await;
                             }
                         }
                     }
@@ -464,7 +473,7 @@ pub async fn run(
                                                 failure_reason: None
                                             }).await {
                                                 Ok(_) => {
-                                                    pipeline.begin_next_deal();
+                                                    pipeline.begin_next_deal().await;
                                                 }
                                                 Err(e) => 
                                                     warn!(
