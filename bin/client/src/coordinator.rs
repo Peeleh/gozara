@@ -157,7 +157,7 @@ impl Pipeline {
         if self.storage_permits.is_empty() {
             return
         }
-        let peers: Vec<PeerId> = self.storage_permits.keys().cloned().collect();     
+        let peers: Vec<PeerId> = self.storage_permits.keys().cloned().collect();
         // skip already finalized chunks
         let active_storage_deal = self.active_storage_deal.as_mut().unwrap();
         let pending_chunks: Vec<_> = active_storage_deal
@@ -217,32 +217,21 @@ impl Pipeline {
                     warn!("Critical to assignment: requested chunks are missing.");
                     return
                 }
-                let num_chunks = chunks.len();
+                if peers.is_empty() {
+                    warn!("Critical to assignment: no peers to assign.");
+                    return
+                }
                 let num_peers = peers.len();
-                let assignments: HashMap<PeerId, Vec<(Hash, Bytes)>> = if num_chunks >= num_peers {
-                    let bucket_size = num_chunks / num_peers;
-                    let buckets = chunks
-                        .chunks(bucket_size)
-                        .into_iter()
-                        .map(|t| t.into())
-                        .collect::<Vec<Vec<(Hash, Bytes)>>>();
-                    peers                        
-                        .into_iter()
-                        .zip(buckets)
-                        .collect()
-                } else {
-                    let mut rng = &mut rand::rng();
-                    let chunks: Vec<Vec<(Hash, Bytes)>> = chunks
-                        .into_iter()
-                        .map(|c| [c].into())
-                        .collect();
-                    peers
-                        .sample(&mut rng, num_chunks)
-                        .into_iter()
-                        .cloned()
-                        .zip(chunks)
-                        .collect()
-                };
+                let mut assignments: HashMap<PeerId, Vec<(Hash, Bytes)>> = HashMap::new();
+                let mut peer_index = 0;
+                let mut chunks_iter = chunks.into_iter();
+                while let Some(chunk) = chunks_iter.next() {
+                    assignments
+                        .entry(peers[peer_index])
+                        .or_default()
+                        .push(chunk);
+                    peer_index = (peer_index + 1) % num_peers;
+                }
                 // upload chunks                 
                 for (peer, asses) in assignments.into_iter() {
                     for (hash, data) in asses.into_iter() {
