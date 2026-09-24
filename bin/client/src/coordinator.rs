@@ -128,7 +128,6 @@ impl Pipeline {
         let now = Instant::now();
         self.storage_permits.retain(|_, expires_at| *expires_at > now);
         if !self.storage_permits.is_empty() {
-            warn!("Have got some storage permits for now. So, no more requests are sent.");
             // todo: check if there are enough permits
             return
         }
