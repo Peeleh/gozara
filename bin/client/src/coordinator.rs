@@ -3,11 +3,12 @@ use std::{
     collections::{VecDeque, HashMap},
     sync::Arc,
 };
-use eyre::{eyre, Result};
+use eyre::{Result};
 use tracing::{info, warn};
 use tokio::{
     sync::{mpsc, oneshot, Semaphore},
-    time::interval
+    time::interval,
+    task::JoinHandle
 };
 use bytes::Bytes;
 use libp2p::PeerId;
@@ -328,7 +329,7 @@ pub async fn run(
     tx_swarm: mpsc::Sender<SwarmMessage>,
     tx_blob: mpsc::Sender<BlobMessage>,
     mut blob_transfer_control: libp2p_stream::Control,
-) -> Result<()> {
+) -> Result<JoinHandle<()>> {
     //  setup blob transfer
     let mut incoming_pushes = blob_transfer::accept_pushes(
         blob_transfer_control.accept(blob_transfer::PUSH_PROTOCOL)?,
@@ -406,7 +407,7 @@ pub async fn run(
                     }
                     None => {
                         warn!("Swarm handler channel is closed.");
-                        break;
+                        break
                     }
                 },
                 // coordination messages
@@ -424,7 +425,7 @@ pub async fn run(
                     }
                     None => {
                         warn!("Coordination channel is closed.");
-                        break;
+                        break
                     }
                 },
                 // internal message
@@ -457,7 +458,7 @@ pub async fn run(
                                 match new_status {
                                     ChunkUploadStatus::Pending | ChunkUploadStatus::Inflight { .. } => {},
                                     ChunkUploadStatus::Finalized {
-                                        at,
+                                        at: _,
                                         owner
                                     } => {
                                         info!(
@@ -490,7 +491,7 @@ pub async fn run(
                     }
                     None => {
                         warn!("Internal channel is closed.");
-                        break;
+                        break
                     }
                 },
                 // <blob transfer>
@@ -524,5 +525,5 @@ pub async fn run(
             }
         }
     });
-    jh.await.map_err(|e| eyre!(e.to_string()))
+    Ok(jh)
 }

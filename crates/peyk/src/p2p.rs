@@ -31,7 +31,6 @@ use libp2p::{
 use libp2p_quic as quic;
 use eyre::Result;
 use crate::protocol;
-use crate::blob_transfer;
 
 // prepare gossipsub behaviour
 fn prepare_gossipsub_behaviour(

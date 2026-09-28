@@ -5,7 +5,7 @@ mod coordinator;
 use std::{
     fs,
 };
-use eyre::Result;
+use eyre::{eyre, Result};
 use tracing::{info, warn};
 use libp2p::{
     identity,
@@ -119,23 +119,44 @@ async fn go_public(
     Ok(swarm)
 }
 
-pub async fn run(
-    config: Config,
-) -> Result<()> {
+pub async fn run(config: Config) -> Result<()> {
     let swarm = go_public(config).await?;
     let blob_transfer_control = swarm.behaviour().blob_stream.new_control();
     let (tx_swarm, rx_swarm) = mpsc::channel::<peyk::SwarmMessage>(16);
     let (tx_handler, rx_handler) = mpsc::channel::<peyk::HandlerMessage>(256);
     let (tx_coord, rx_coord) = mpsc::channel::<coordinator::CoordMessage>(256);
-    let (tx_blob, rx_blob) = mpsc::channel::<blob_store::BlobMessage>(4);
-    peyk::process_swarm(swarm, rx_swarm, tx_handler).await?; 
-    coordinator::run(
-        rx_coord,
-        rx_handler,
-        tx_swarm,
-        tx_blob.clone(),
-        blob_transfer_control,
-    ).await?;
-    blob_store::run(rx_blob, tx_coord).await?;
-    Ok(())
+    let (tx_blob, rx_blob) = mpsc::channel::<blob_store::BlobMessage>(4);    
+    let (mut swarm_jh, mut coord_jh, mut blob_jh) = tokio::try_join!(
+        peyk::process_swarm(swarm, rx_swarm, tx_handler),
+        coordinator::run(rx_coord, rx_handler, tx_swarm, tx_blob, blob_transfer_control),
+        blob_store::run(rx_blob, tx_coord),
+    )?;
+    tokio::select! {
+        r = &mut swarm_jh => {
+            coord_jh.abort();
+            blob_jh.abort();
+            match r {
+                Ok(_) => Err(eyre!("Swarm task exited unexpectedly.")),
+                Err(e) => Err(eyre!("Swarm task panicked: {e:?}"))
+            }
+        },
+
+        r = &mut coord_jh => {
+            swarm_jh.abort();
+            blob_jh.abort();
+            match r {
+                Ok(_) => Err(eyre!("Coordinator task exited unexpectedly.")),
+                Err(e) => Err(eyre!("Coordinator task panicked: {e:?}"))
+            }
+        },
+
+        r = &mut blob_jh => {
+            swarm_jh.abort();
+            coord_jh.abort();
+            match r {
+                Ok(_) => Err(eyre!("Blob store task exited unexpectedly.")),
+                Err(e) => Err(eyre!("Blob store task panicked: {e:?}"))
+            }
+        }        
+    }
 }

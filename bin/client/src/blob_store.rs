@@ -7,7 +7,7 @@ use eyre::{eyre, Result};
 use tracing::{info, warn};
 use serde::Serialize;
 use tokio::{
-    task::JoinHandle,
+    task::{JoinSet, JoinHandle},
     sync::{mpsc, oneshot},
     time::interval
 };
@@ -145,11 +145,11 @@ fn start_blob_store(
     mut rx_blob: mpsc::Receiver<BlobMessage>,
     tx_coord: mpsc::Sender<CoordMessage>,
     bridge_state: BridgeState,
-) -> JoinHandle<()> {
+) -> Result<JoinHandle<()>> {
     let mut blob_store = BlobStore::new();
     // to remove stale blobs
     let mut timer_stale_blobs = interval(Duration::from_secs(60));
-    tokio::spawn(async move {
+    let jh = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _i = timer_stale_blobs.tick() => {
@@ -281,7 +281,8 @@ fn start_blob_store(
                 }
             }
         }
-    })
+    });
+    Ok(jh)
 }
 
 // 1 GiB
@@ -380,10 +381,30 @@ async fn serve_bridge(
 pub async fn run(
     rx_blob: mpsc::Receiver<BlobMessage>,
     tx_coord: mpsc::Sender<CoordMessage>
-) -> Result<()> {
-    let (tx_internal, rx_internal) = mpsc::channel::<InternalMessage>(4);
-    let bridge_state = BridgeState::new(tx_internal);
-    let _jh = start_blob_store(rx_internal, rx_blob, tx_coord, bridge_state.clone());
-    serve_bridge(bridge_state).await?;
-    Ok(())
+) -> Result<JoinHandle<()>> {
+    let jh = tokio::spawn(async move {
+        let mut js = JoinSet::new();
+        let (tx_internal, rx_internal) = mpsc::channel::<InternalMessage>(4);
+        let bridge_state = BridgeState::new(tx_internal);
+        let bridge_state_bs = bridge_state.clone();
+        // blob store
+        js.spawn(async move {
+            if let Err(e) = start_blob_store(rx_internal, rx_blob, tx_coord, bridge_state_bs) {
+                warn!("Failed to start blob store: {:?}", e);
+            }
+                
+        });
+        // bridge
+        js.spawn(async move {
+            if let Err(e) = serve_bridge(bridge_state).await {
+                warn!("Failed to serve the HTTP bridge: {:?}: ", e);
+            }
+        });
+        while let Some(result) = js.join_next().await {
+            if let Err(e) = result {
+                warn!("Failed to spawn tasks: {:?}", e);
+            }
+        }
+    });
+    Ok(jh)
 }

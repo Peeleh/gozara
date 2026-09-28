@@ -2,10 +2,7 @@ pub mod p2p;
 pub mod protocol;
 pub mod blob_transfer;
 
-use std::{
-    time::Duration,
-    collections::HashMap
-};
+use std::time::Duration;
 use futures::stream::StreamExt;
 use eyre::Result;
 use tracing::{info, warn};
@@ -23,10 +20,10 @@ use libp2p::{
 };
 use tokio::{
     sync::{mpsc},
-    time::interval
+    time::interval,
+    task::JoinHandle
 };
 use tokio_stream::wrappers::IntervalStream;
-use bytes::Bytes;
 use p2p::{GlobalBehaviour, GlobalBehaviourEvent};
 
 pub enum SwarmMessage {
@@ -57,8 +54,8 @@ pub async fn process_swarm(
     mut swarm: Swarm<GlobalBehaviour>,
     mut rx: mpsc::Receiver<SwarmMessage>,
     tx_handler: mpsc::Sender<HandlerMessage>
-) -> Result<()> {
-    tokio::spawn(async move {
+) -> Result<JoinHandle<()>> {
+    let jh = tokio::spawn(async move {
         // to update kademlia tables
         let mut timer_peer_discovery = IntervalStream::new(
             interval(Duration::from_secs(60))
@@ -97,7 +94,7 @@ pub async fn process_swarm(
                     }
                     None => {
                         warn!("Swarm channel is closed.");
-                        continue
+                        break
                     }
                 },                
                 
@@ -219,14 +216,7 @@ pub async fn process_swarm(
                             ..
                         },
                         ..
-                    })) => {                 
-                        // let _ = swarm
-                        //     .behaviour_mut()
-                        //     .req_resp
-                        //     .send_response(
-                        //         channel,
-                        //         protocol::Response::Accept
-                        //     );
+                    })) => {
                         if let Err(e) = tx_handler.send(HandlerMessage::Request {
                             peer_id: peer_id,
                             request_id: request_id,
@@ -268,5 +258,5 @@ pub async fn process_swarm(
             }
         }
     });
-    Ok(())
+    Ok(jh)
 }

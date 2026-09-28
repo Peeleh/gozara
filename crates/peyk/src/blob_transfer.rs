@@ -1,6 +1,6 @@
 // Claude generated code
 use eyre::{eyre, Result};
-use tracing::{info, warn};
+use tracing::{warn};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use libp2p::{PeerId, StreamProtocol};
 use libp2p_stream::{Control, IncomingStreams};
@@ -48,7 +48,10 @@ async fn read_frame<R: AsyncRead + Unpin>(
     io.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > max_len {
-        return Err(eyre!(format!("frame of {len} bytes exceeds {max_len}-byte limit")))
+        return Err(eyre!(format!(
+            "frame of {} bytes exceeds {}-byte limit",
+            len, max_len
+        )))
     }
     let mut buf = vec![0u8; len];
     io.read_exact(&mut buf).await?;
@@ -84,7 +87,9 @@ pub async fn push(
         let reason = read_frame(&mut stream, 4096).await?;
         Err(eyre!(String::from_utf8_lossy(&reason).into_owned()))
     };
-    stream.close().await?;
+    if let Err(e) = stream.close().await {
+        warn!("Peer closed the push stream unexpectedly: {:?}", e);
+    }
 
     let len = data.len();
     let _ = events_tx.send(TransferEvent {
@@ -124,11 +129,14 @@ pub async fn pull(
             Ok(Some(data))
         } else {
             Err(eyre!(format!(
-                "Pull hash mismatch, expected `{}` but got `{}`", hash, received_hash
+                "Pull hash mismatch, expected `{}` but got `{}`",
+                hash, received_hash
             )))
         }
     };
-    stream.close().await?;
+    if let Err(e) = stream.close().await {
+        warn!("Peer closed the pull stream unexpectedly: {:?}", e);
+    }
 
     let len = match &result {
         Ok(Some(data)) => data.len(),
@@ -199,16 +207,17 @@ async fn handle_incoming_push(
             format!("integrity check failed (got {actual_hash})").as_bytes(),
         )
         .await?;
-        stream.close().await?;
+        let _ = stream.close().await;
         return Err(eyre!(format!(
-            "Hash mismatch for incoming push, expected `{}` got `{}`",
-            expected_hash,
-            actual_hash
+            "Hash mismatch for incoming push, expected `{}` got `{}`.",
+            expected_hash, actual_hash
         )))
     }
 
     stream.write_all(&[1u8]).await?;
-    stream.close().await?;
+    if let Err(e) = stream.close().await {
+        warn!(%peer, error = %e, "Unclean close for push stream after a successful transfer.")
+    }
     let _ = tx.send(IncomingPush {
         peer,
         hash: actual_hash,
@@ -225,8 +234,8 @@ pub fn accept_pulls(
         while let Some((peer, stream)) = incoming.next().await {
             let tx = tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_incoming_get(stream, peer, tx).await {
-                    warn!(%peer, error = %e, "blob pull failed");
+                if let Err(e) = handle_incoming_pull(stream, peer, tx).await {
+                    warn!(%peer, error = %e, "Blob pull failed.");
                 }
             });
         }
@@ -234,7 +243,7 @@ pub fn accept_pulls(
     rx
 }
 
-async fn handle_incoming_get(
+async fn handle_incoming_pull(
     mut stream: impl AsyncRead + AsyncWrite + Unpin,
     peer: PeerId,
     tx: mpsc::UnboundedSender<IncomingPull>,
