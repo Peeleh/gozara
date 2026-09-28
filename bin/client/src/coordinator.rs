@@ -387,7 +387,7 @@ pub async fn run(
                             }
                             HandlerMessage::Response {
                                 peer_id,
-                                request_id: _,
+                                request_id,
                                 response
                             } => {
                                 match response {

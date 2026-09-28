@@ -1,3 +1,4 @@
+mod bridge;
 mod blob_store;
 mod blake3_wrapper;
 mod coordinator;
@@ -125,16 +126,19 @@ pub async fn run(config: Config) -> Result<()> {
     let (tx_swarm, rx_swarm) = mpsc::channel::<peyk::SwarmMessage>(16);
     let (tx_handler, rx_handler) = mpsc::channel::<peyk::HandlerMessage>(256);
     let (tx_coord, rx_coord) = mpsc::channel::<coordinator::CoordMessage>(256);
-    let (tx_blob, rx_blob) = mpsc::channel::<blob_store::BlobMessage>(4);    
-    let (mut swarm_jh, mut coord_jh, mut blob_jh) = tokio::try_join!(
+    let (tx_blob, rx_blob) = mpsc::channel::<blob_store::BlobMessage>(4);
+    let (tx_bridge, rx_bridge) = mpsc::channel::<bridge::BridgeMessage>(256);
+    let (mut swarm_jh, mut coord_jh, mut blob_jh, mut bridge_jh) = tokio::try_join!(
         peyk::process_swarm(swarm, rx_swarm, tx_handler),
-        coordinator::run(rx_coord, rx_handler, tx_swarm, tx_blob, blob_transfer_control),
-        blob_store::run(rx_blob, tx_coord),
+        coordinator::run(rx_coord, rx_handler, tx_swarm, tx_blob.clone(), blob_transfer_control),
+        blob_store::run(rx_blob, tx_bridge, tx_coord),
+        bridge::run(rx_bridge, tx_blob)
     )?;
     tokio::select! {
         r = &mut swarm_jh => {
             coord_jh.abort();
             blob_jh.abort();
+            bridge_jh.abort();
             match r {
                 Ok(_) => Err(eyre!("Swarm task exited unexpectedly.")),
                 Err(e) => Err(eyre!("Swarm task panicked: {e:?}"))
@@ -144,6 +148,7 @@ pub async fn run(config: Config) -> Result<()> {
         r = &mut coord_jh => {
             swarm_jh.abort();
             blob_jh.abort();
+            bridge_jh.abort();
             match r {
                 Ok(_) => Err(eyre!("Coordinator task exited unexpectedly.")),
                 Err(e) => Err(eyre!("Coordinator task panicked: {e:?}"))
@@ -153,10 +158,21 @@ pub async fn run(config: Config) -> Result<()> {
         r = &mut blob_jh => {
             swarm_jh.abort();
             coord_jh.abort();
+            bridge_jh.abort();
             match r {
                 Ok(_) => Err(eyre!("Blob store task exited unexpectedly.")),
                 Err(e) => Err(eyre!("Blob store task panicked: {e:?}"))
             }
-        }        
+        },
+
+        r = &mut bridge_jh => {
+            swarm_jh.abort();
+            coord_jh.abort();
+            blob_jh.abort();
+            match r {
+                Ok(_) => Err(eyre!("Bridge task exited unexpectedly.")),
+                Err(e) => Err(eyre!("Bride task panicked: {e:?}"))
+            }
+        },
     }
 }
