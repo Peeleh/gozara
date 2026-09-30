@@ -23,6 +23,7 @@ use tokio::{
     time::interval,
     task::JoinHandle
 };
+use tokio_util::sync::CancellationToken;
 use tokio_stream::wrappers::IntervalStream;
 use p2p::{GlobalBehaviour, GlobalBehaviourEvent};
 
@@ -53,7 +54,8 @@ pub enum HandlerMessage {
 pub async fn process_swarm(
     mut swarm: Swarm<GlobalBehaviour>,
     mut rx: mpsc::Receiver<SwarmMessage>,
-    tx_handler: mpsc::Sender<HandlerMessage>
+    tx_handler: mpsc::Sender<HandlerMessage>,
+    shutdown: CancellationToken,
 ) -> Result<JoinHandle<()>> {
     let jh = tokio::spawn(async move {
         // to update kademlia tables
@@ -63,6 +65,9 @@ pub async fn process_swarm(
 
         loop {
             tokio::select! {
+                _ = shutdown.cancelled() => {
+                    warn!("Received shutdown request.");
+                },
                 // try to discover new peers
                 _i = timer_peer_discovery.select_next_some() => {                
                     let random_peer_id = PeerId::random();

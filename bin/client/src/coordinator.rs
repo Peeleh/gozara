@@ -10,6 +10,7 @@ use tokio::{
     time::interval,
     task::JoinHandle
 };
+use tokio_util::sync::CancellationToken;
 use bytes::Bytes;
 use libp2p::PeerId;
 use crate::blob_store::{Hash, BlobMessage} ;
@@ -329,6 +330,7 @@ pub async fn run(
     tx_swarm: mpsc::Sender<SwarmMessage>,
     tx_blob: mpsc::Sender<BlobMessage>,
     mut blob_transfer_control: libp2p_stream::Control,
+    shutdown: CancellationToken,
 ) -> Result<JoinHandle<()>> {
     //  setup blob transfer
     let mut incoming_pushes = blob_transfer::accept_pushes(
@@ -353,6 +355,11 @@ pub async fn run(
     let jh = tokio::spawn(async move {
         loop {
             tokio::select! {
+                _ = shutdown.cancelled() => {
+                    warn!("Received shutdown request.");
+                    break
+                },
+
                 _i = timer_stale_providers.tick() => {
                     pipeline
                         .storage_provider_hints
@@ -363,6 +370,7 @@ pub async fn run(
                         pipeline.request_storage_permits().await;
                     }
                 },
+
                 _i = timer_assign.tick() => {
                     pipeline.assign_chunks().await;                    
                 },

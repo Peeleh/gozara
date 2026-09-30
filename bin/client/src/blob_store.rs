@@ -9,6 +9,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::interval
 };
+use tokio_util::sync::CancellationToken;
 use rs_merkle::MerkleTree;
 use bytes::Bytes;
 use crate::coordinator::CoordMessage;
@@ -130,6 +131,7 @@ pub async fn run(
     mut rx_blob: mpsc::Receiver<BlobMessage>,
     tx_bridge: mpsc::Sender<BridgeMessage>,
     tx_coord: mpsc::Sender<CoordMessage>,
+    shutdown: CancellationToken
 ) -> Result<JoinHandle<()>> {
     let mut blob_store = BlobStore::new();
     // to remove stale blobs
@@ -137,6 +139,11 @@ pub async fn run(
     let jh = tokio::spawn(async move {
         loop {
             tokio::select! {
+                _ = shutdown.cancelled() => {
+                    warn!("Received shutdown request.");
+                    break
+                },
+
                 _i = timer_stale_blobs.tick() => {
                     blob_store.remove_stale_blobs();
                 },

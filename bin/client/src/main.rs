@@ -6,6 +6,8 @@ use eyre::{
     Result,
     Context
 };
+use tokio_util::sync::CancellationToken;
+use common::shutdown::wait_for_shutdown_signal;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,6 +34,8 @@ async fn main() -> Result<()> {
             .with_context(|| "`EXTERNAL_PORT` is missing")?,
         zone: env::var("ZONE").unwrap_or("ME".to_string()),
     };
-    client::run(cfg).await?;
+    let token = CancellationToken::new();
+    tokio::spawn(wait_for_shutdown_signal(token.clone()));
+    client::run(cfg, token).await?;
     Ok(())
 }

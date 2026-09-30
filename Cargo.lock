@@ -577,6 +577,7 @@ dependencies = [
  "blake3",
  "bytes",
  "clap",
+ "common",
  "dashmap",
  "dotenv",
  "eyre",
@@ -627,6 +628,16 @@ checksum = "cfc320937d09e6de266b31b9afb480f197d7a861be86be7cb2ea7e5d1bfffc5e"
 dependencies = [
  "bytes",
  "memchr",
+]
+
+[[package]]
+name = "common"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -2679,6 +2690,7 @@ dependencies = [
  "serde",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tracing",
 ]
 

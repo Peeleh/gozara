@@ -30,4 +30,6 @@ rs_merkle.workspace = true
 hex.workspace = true
 bytes.workspace = true
 rand.workspace = true
+
+common.workspace = true
 peyk.workspace = true

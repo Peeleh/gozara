@@ -14,6 +14,7 @@ use libp2p::{
     PeerId,
 };
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use libp2p::swarm::Swarm;
 use peyk::blob_transfer;
 
@@ -120,7 +121,10 @@ async fn go_public(
     Ok(swarm)
 }
 
-pub async fn run(config: Config) -> Result<()> {
+pub async fn run(
+    config: Config,
+    shutdown: CancellationToken
+) -> Result<()> {
     let swarm = go_public(config).await?;
     let blob_transfer_control = swarm.behaviour().blob_stream.new_control();
     let (tx_swarm, rx_swarm) = mpsc::channel::<peyk::SwarmMessage>(16);
@@ -129,10 +133,10 @@ pub async fn run(config: Config) -> Result<()> {
     let (tx_blob, rx_blob) = mpsc::channel::<blob_store::BlobMessage>(4);
     let (tx_bridge, rx_bridge) = mpsc::channel::<bridge::BridgeMessage>(256);
     let (mut swarm_jh, mut coord_jh, mut blob_jh, mut bridge_jh) = tokio::try_join!(
-        peyk::process_swarm(swarm, rx_swarm, tx_handler),
-        coordinator::run(rx_coord, rx_handler, tx_swarm, tx_blob.clone(), blob_transfer_control),
-        blob_store::run(rx_blob, tx_bridge, tx_coord),
-        bridge::run(rx_bridge, tx_blob)
+        peyk::process_swarm(swarm, rx_swarm, tx_handler, shutdown.clone()),
+        coordinator::run(rx_coord, rx_handler, tx_swarm, tx_blob.clone(), blob_transfer_control, shutdown.clone()),
+        blob_store::run(rx_blob, tx_bridge, tx_coord, shutdown.clone()),
+        bridge::run(rx_bridge, tx_blob, shutdown)
     )?;
     tokio::select! {
         r = &mut swarm_jh => {

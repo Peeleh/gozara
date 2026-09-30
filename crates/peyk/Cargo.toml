@@ -6,8 +6,6 @@ repository = { workspace = true }
 keywords = { workspace = true }
 categories = { workspace = true }
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 serde.workspace = true
 # env_logger = "0.10.0"
@@ -22,6 +20,7 @@ eyre.workspace = true
 # async-trait.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 bincode.workspace = true
 bytes.workspace = true

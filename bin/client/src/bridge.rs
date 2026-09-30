@@ -6,6 +6,7 @@ use tokio::{
     task::JoinHandle,
     sync::mpsc,
 };
+use tokio_util::sync::CancellationToken;
 use axum::{
     body::Bytes,
     extract::{Path, DefaultBodyLimit, State},
@@ -103,10 +104,12 @@ async fn new_blob(
 
 pub async fn run(
     mut rx_bridge: mpsc::Receiver<BridgeMessage>,
-    tx_blob: mpsc::Sender<BlobMessage>
+    tx_blob: mpsc::Sender<BlobMessage>,
+    shutdown: CancellationToken
 ) -> Result<JoinHandle<()>> {
     let state = BridgeState::new(tx_blob);
     let state_server = state.clone();
+    let shutdown_bridge = shutdown.clone();
     let mut server_jh = tokio::spawn(async move {
         let app = Router::new()
             .route("/status/{id}", get(get_status))   
@@ -125,7 +128,7 @@ pub async fn run(
         };
         info!("Artifact store HTTP bridge is up and listening on port 8709.");
         if let Err(e) = axum::serve(listener, app)
-            // .with_graceful_shutdown(shutdown.cancelled_owned())
+            .with_graceful_shutdown(shutdown_bridge.cancelled_owned())
             .await
         {
             warn!("Failed to start HTTP bridge server: {:?}", e);
@@ -134,6 +137,11 @@ pub async fn run(
     let mut msg_jh = tokio::spawn(async move {
         loop {
             tokio::select! {
+                _ = shutdown.cancelled() => {
+                    warn!("Received shutdown request.");
+                    break
+                },
+
                 m = rx_bridge.recv() => match m {
                     Some(b_msg) => {
                         match b_msg {
