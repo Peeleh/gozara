@@ -134,10 +134,11 @@ pub async fn run(
             warn!("Failed to start HTTP bridge server: {:?}", e);
         }
     });
+    let shutdown_msg = shutdown.clone();
     let mut msg_jh = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => {
+                _ = shutdown_msg.cancelled() => {
                     warn!("Received shutdown request.");
                     break
                 },
@@ -175,14 +176,14 @@ pub async fn run(
     Ok(tokio::spawn(async move {
         tokio::select! {
             r = &mut server_jh => {
-                msg_jh.abort();
+                shutdown.cancel();
                 if let Err(e) = r {
                     warn!("The Axum server task panicked: {e:?}");
                 }
             },
 
             r = &mut msg_jh => {
-                server_jh.abort();
+                shutdown.cancel();
                 if let Err(e) = r {
                     warn!("The bridge channel task panicked: {e:?}");
                 }

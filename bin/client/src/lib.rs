@@ -136,13 +136,11 @@ pub async fn run(
         peyk::process_swarm(swarm, rx_swarm, tx_handler, shutdown.clone()),
         coordinator::run(rx_coord, rx_handler, tx_swarm, tx_blob.clone(), blob_transfer_control, shutdown.clone()),
         blob_store::run(rx_blob, tx_bridge, tx_coord, shutdown.clone()),
-        bridge::run(rx_bridge, tx_blob, shutdown)
+        bridge::run(rx_bridge, tx_blob, shutdown.clone())
     )?;
     tokio::select! {
         r = &mut swarm_jh => {
-            coord_jh.abort();
-            blob_jh.abort();
-            bridge_jh.abort();
+            shutdown.cancel();
             match r {
                 Ok(_) => Err(eyre!("Swarm task exited unexpectedly.")),
                 Err(e) => Err(eyre!("Swarm task panicked: {e:?}"))
@@ -150,9 +148,7 @@ pub async fn run(
         },
 
         r = &mut coord_jh => {
-            swarm_jh.abort();
-            blob_jh.abort();
-            bridge_jh.abort();
+            shutdown.cancel();
             match r {
                 Ok(_) => Err(eyre!("Coordinator task exited unexpectedly.")),
                 Err(e) => Err(eyre!("Coordinator task panicked: {e:?}"))
@@ -160,9 +156,7 @@ pub async fn run(
         },
 
         r = &mut blob_jh => {
-            swarm_jh.abort();
-            coord_jh.abort();
-            bridge_jh.abort();
+           shutdown.cancel();
             match r {
                 Ok(_) => Err(eyre!("Blob store task exited unexpectedly.")),
                 Err(e) => Err(eyre!("Blob store task panicked: {e:?}"))
@@ -170,9 +164,7 @@ pub async fn run(
         },
 
         r = &mut bridge_jh => {
-            swarm_jh.abort();
-            coord_jh.abort();
-            blob_jh.abort();
+            shutdown.cancel();
             match r {
                 Ok(_) => Err(eyre!("Bridge task exited unexpectedly.")),
                 Err(e) => Err(eyre!("Bride task panicked: {e:?}"))
