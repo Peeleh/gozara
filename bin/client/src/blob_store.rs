@@ -1,6 +1,8 @@
 use std::{
     time::{Instant, Duration},
     collections::HashMap,
+    path::Path,
+    fs
 };
 use eyre::{eyre, Result};
 use tracing::{info, warn};
@@ -14,7 +16,7 @@ use rs_merkle::MerkleTree;
 use bytes::Bytes;
 use crate::coordinator::CoordMessage;
 use crate::bridge::{
-    BridgeMessage, UploadStatus
+    BridgeMessage, Status
 };
 use crate::blake3_wrapper::Blake3Hash;
 
@@ -29,6 +31,11 @@ const BLOB_LIFETIME: u64 = 4 * 60 * 60;
 
 pub enum BlobMessage {
     // src: the bridge
+    GetBlob {
+        id: String,
+        // tx_reply: oneshot::Sender<Option<Bytes>>
+    },
+    // src: the bridge
     NewBlob {
         id: String,
         data: Bytes,
@@ -38,7 +45,7 @@ pub enum BlobMessage {
     FetchChunks {
         id: String,
         chunks: Vec<Hash>,
-        tx_reply: oneshot::Sender<Option<HashMap<Hash, Option<Bytes>>>>,
+        tx_reply: oneshot::Sender<Option<HashMap<Hash, Option<Bytes>>>>
     },
     // src: the coordinator
     // to notify about blob distribution result
@@ -111,8 +118,23 @@ impl BlobStore {
         Ok(())
     }
 
-    pub fn remove_blob(&mut self, id: &str) {
-        let _b = self.blobs.remove(id);
+    pub fn archive_blob(&mut self, id: &str) -> Result<()> {
+        let blob = self.blobs.remove(id).unwrap();
+        // todo: archive blob meta
+        // {
+        //     const BASE_PATH: &str = "./blobs";
+        //     let blob_path = format!("{BASE_PATH}/{id}");
+        //     info!("Archiving blob(`{}`) to `{}`", id, blob_path);
+        //     let should_create = match fs::exists(BASE_PATH) {
+        //         Err(_) => true,
+        //         Ok(exists) => !exists
+        //     };
+        //     if should_create {
+        //         fs::create_dir(BASE_PATH)?;
+        //     }
+        //     let _ = fs::write(&blob_path, blob.data.as_ref())?;
+        // }
+        Ok(())
     }
 
     // periodic cleanup
@@ -150,6 +172,10 @@ pub async fn run(
 
                 m = rx_blob.recv() =>  match m {
                     Some(bm) => match bm {
+                        BlobMessage::GetBlob { id } => {
+                            // todo
+
+                        }
                         BlobMessage::NewBlob { id, data } => {
                             match blob_store.add_blob(id.clone(), data) {
                                 Ok(_) => {
@@ -168,7 +194,7 @@ pub async fn run(
                                     warn!("Add blob error: {:?}", add_err);
                                     if let Err(e) = tx_bridge.send(BridgeMessage::UpdateStatus {
                                         id,
-                                        status: UploadStatus::Failed { reason: Some(add_err.to_string()) }
+                                        status: Status::Failed { reason: Some(add_err.to_string()) }
                                     }).await {
                                         warn!("Failed to notify the Bridge about this error: {:?}", e);
                                     }
@@ -220,11 +246,17 @@ pub async fn run(
 
                             if success {
                                 info!("Blob(`{}`) is now stored globally.", id);
-                                // todo: archive blob meta
-                                blob_store.remove_blob(&id);
+                                let path = match blob_store.archive_blob(&id) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        warn!("Failed to archive blob: {e:?}");
+                                        // todo: how to deal with it?
+                                        continue
+                                    }
+                                };
                                 if let Err(e) = tx_bridge.send(BridgeMessage::UpdateStatus {
                                     id,
-                                    status: UploadStatus::Finalized
+                                    status: Status::Finalized
                                 }).await {
                                     warn!("Failed to notify the Bridge about the finalized state of blob: {:?}", e);
                                 }
@@ -238,7 +270,7 @@ pub async fn run(
                                 );
                                 if let Err(e) = tx_bridge.send(BridgeMessage::UpdateStatus {
                                     id,
-                                    status: UploadStatus::Failed { reason }
+                                    status: Status::Failed { reason }
                                 }).await {
                                     warn!("Failed to notify the Bridge about the failed state of the blob: {:?}", e);
                                 }

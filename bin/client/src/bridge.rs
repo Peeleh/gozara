@@ -1,12 +1,19 @@
-use std::sync::Arc;
+use std::{
+    time::Instant,
+    sync::Arc,
+};
 use eyre::Result;
 use tracing::{info, warn};
 use serde::Serialize;
 use tokio::{
+    fs::File,
     task::JoinHandle,
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{
+    sync::CancellationToken,
+    io::ReaderStream
+};
 use axum::{
     body::Bytes,
     extract::{Path, DefaultBodyLimit, State},
@@ -15,7 +22,11 @@ use axum::{
     Router,
     response::{Json, IntoResponse}
 };
-use tower::limit::ConcurrencyLimitLayer;
+use tower::{
+    ServiceExt,
+    limit::ConcurrencyLimitLayer
+};
+use tower_http::services::ServeFile;
 use dashmap::{
     DashMap,
     mapref::entry::Entry
@@ -28,30 +39,39 @@ const MAX_BLOB_SIZE: usize = 1 * 1024 * 1024 * 1024;
 const TOTAL_INBOUND_BLOB_PRESSURE: usize = 8;
 
 #[derive(Clone, Serialize, Debug)]
-#[serde(tag = "upload_status", rename_all = "lowercase")]
-pub enum UploadStatus {
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum Status {
+    // outbound blobs
     Pending,
+    // inbound blobs
+    Missing,
     Finalized,
     Failed { reason: Option<String> },
+}
+
+#[derive(Clone, Debug)]
+struct TimestampedStatus {
+    at: Instant,
+    status: Status,
 }
 
 pub enum BridgeMessage {
     UpdateStatus {
         id: String,
-        status: UploadStatus
+        status: Status
     }
 }
 
 #[derive(Clone)]
 pub struct BridgeState {
-    upload_status_map: Arc<DashMap<String, UploadStatus>>,
+    status_map: Arc<DashMap<String, Vec<TimestampedStatus>>>,
     tx_blob: mpsc::Sender<BlobMessage>
 }
 
 impl BridgeState {
     pub fn new(tx_blob: mpsc::Sender<BlobMessage>) -> Self {
         BridgeState {
-            upload_status_map: Arc::new(DashMap::new()),
+            status_map: Arc::new(DashMap::new()),
             tx_blob
         }
     }
@@ -61,9 +81,45 @@ async fn get_status(
     State(state): State<BridgeState>,
     Path(id): Path<String>
 ) -> impl IntoResponse {
-    match state.upload_status_map.get(&id) {
-        Some(status) => (StatusCode::OK, Json(status.clone())).into_response(),
+    match state.status_map.get(&id) {
+        Some(status_list) => {
+            let most_recent_status = &status_list.last().unwrap().status;
+            (StatusCode::OK, Json(most_recent_status)).into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+async fn get_blob(
+    State(state): State<BridgeState>,
+    Path(id): Path<String>,
+    req: axum::extract::Request
+) -> impl IntoResponse {
+    let status = state.status_map
+        .get(&id)
+        .map(|status_list| status_list.last().unwrap().status.clone())
+        .unwrap_or(Status::Missing);
+    match status {
+        Status::Finalized  => {
+            // ServeFile::new(path)
+            //     .oneshot(req)
+            //     .await
+            //     .into_response()
+            StatusCode::TOO_EARLY.into_response()
+        }
+        Status::Missing => {
+            if let Err(e) = state.tx_blob.send(BlobMessage::GetBlob {
+                id: id.clone()
+            }).await {
+                warn!("Failed to send the get blob message to the blob store: {e:?}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+
+            StatusCode::TOO_EARLY.into_response()
+        }
+        _  => {
+            (StatusCode::TOO_EARLY, Json(status.clone())).into_response()
+        }
     }
 }
 
@@ -78,13 +134,16 @@ async fn new_blob(
         body.len() as f32 / 1_048_576f32
     );
     // todo: this check should be a match and the pending, ... flow should be strictly scrutinized
-    match state.upload_status_map.entry(id.clone()) {
+    match state.status_map.entry(id.clone()) {
         Entry::Occupied(_) => {
             warn!("Ignored duplicate blob(`{}`).", id);
             return StatusCode::CONFLICT
         }
         Entry::Vacant(entry) => {
-            entry.insert(UploadStatus::Pending);
+            entry.insert(vec![TimestampedStatus {
+                at: Instant::now(),
+                status: Status::Pending
+            }]);
         }
     }
 
@@ -93,10 +152,7 @@ async fn new_blob(
             id: id.clone(),
             data: body
     }).await {
-        warn!(
-            "Failed to send blob to the blob center: `{:?}`",
-            e
-        );
+        warn!("Failed to send the new blob to the blob store: {e:?}");
         return StatusCode::INTERNAL_SERVER_ERROR
     }
     StatusCode::CREATED
@@ -150,9 +206,12 @@ pub async fn run(
                                 id,
                                 status
                             } => {
-                                match state.upload_status_map.entry(id.clone()) {
+                                match state.status_map.entry(id.clone()) {
                                     Entry::Occupied(mut entry) => {
-                                        entry.insert(status);
+                                        entry.get_mut().push(TimestampedStatus {
+                                            at: Instant::now(),
+                                            status: status
+                                        });
                                     }
                                     Entry::Vacant(_) => {
                                         warn!(

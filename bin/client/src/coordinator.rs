@@ -506,7 +506,7 @@ pub async fn run(
                 // pushes
                 p = incoming_pushes.recv() => match p {
                     Some(push) => {
-                        // push.peer, push.data
+                        // push.peer push.hash, push.data
                     },
                     None => {
                         break
