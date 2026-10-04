@@ -65,7 +65,7 @@ pub enum BridgeMessage {
 #[derive(Clone)]
 pub struct BridgeState {
     status_map: Arc<DashMap<String, Vec<TimestampedStatus>>>,
-    tx_blob: mpsc::Sender<BlobMessage>
+    tx_blob: mpsc::Sender<BlobMessage>,
 }
 
 impl BridgeState {
@@ -109,7 +109,7 @@ async fn get_blob(
         }
         Status::Missing => {
             if let Err(e) = state.tx_blob.send(BlobMessage::GetBlob {
-                id: id.clone()
+                id: id.clone(),
             }).await {
                 warn!("Failed to send the get blob message to the blob store: {e:?}");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response()

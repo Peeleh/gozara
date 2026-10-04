@@ -29,7 +29,10 @@ pub enum CoordMessage {
         id: String,
         root_hash: Hash,
         chunk_hashes: Vec<Hash>,
-    }, 
+    },
+    GatherBlob {
+        id: String,
+    } 
 }
 
 enum InternalMessage {
@@ -268,7 +271,7 @@ impl Pipeline {
                                 hash,
                                 new_status: ChunkUploadStatus::Inflight {
                                     created_at: Instant::now(),
-                                    to: peer.clone()
+                                    to: peer
                                 }
                             }) {
                                 warn!(
@@ -279,7 +282,7 @@ impl Pipeline {
                             }
                             if let Err(e) = blob_transfer::push(
                                 control,
-                                peer.clone(),
+                                peer,
                                 hash_str.clone(),
                                 data,
                                 tx_events
@@ -287,7 +290,7 @@ impl Pipeline {
                                 warn!(
                                     "Push blob(`{}`) to Peer(`{}`) failed: {}",
                                     hash_str,
-                                    peer.clone(),
+                                    peer,
                                     e
                                 );
                                 // keep it at inflight to simulate backoff
@@ -303,7 +306,7 @@ impl Pipeline {
                                 hash,
                                 new_status: ChunkUploadStatus::Finalized {
                                     at: Instant::now(),
-                                    owner: peer.clone()
+                                    owner: peer
                                 }
                             }) {
                                 warn!(
@@ -399,16 +402,17 @@ pub async fn run(
                                 response
                             } => {
                                 match response {
-                                    peyk::protocol::Response::AckStoragePermit { valid_for } => {
+                                    peyk::protocol::Response::IssuedStoragePermit { valid_for } => {
                                         let now = Instant::now();
                                         pipeline.storage_permits.insert(
-                                            peer_id.clone(),
+                                            peer_id,
                                             now.checked_add(
                                                 Duration::from_secs(valid_for as u64)
                                             ).unwrap_or_else(|| now)
                                         );
                                         // todo: storage permit is already invalid
                                     }
+                                    peyk::protocol::Response::BlobMeta {..} => {}
                                 }
                             }    
                         }
@@ -429,6 +433,7 @@ pub async fn run(
                             } => {              
                                 pipeline.add_new_deal(id, root_hash, chunk_hashes).await;
                             }
+                            CoordMessage::GatherBlob {..}=> {}
                         }
                     }
                     None => {

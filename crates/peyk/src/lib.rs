@@ -91,7 +91,7 @@ pub async fn process_swarm(
                                         .req_resp
                                         .send_request(
                                             peer,
-                                            protocol::Request::RequestStoragePermit
+                                            protocol::Request::StoragePermit
                                         );
                                 }
                             }

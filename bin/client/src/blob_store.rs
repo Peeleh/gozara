@@ -16,7 +16,8 @@ use rs_merkle::MerkleTree;
 use bytes::Bytes;
 use crate::coordinator::CoordMessage;
 use crate::bridge::{
-    BridgeMessage, Status
+    BridgeMessage,
+    Status as BridgeStatus
 };
 use crate::blake3_wrapper::Blake3Hash;
 
@@ -31,9 +32,9 @@ const BLOB_LIFETIME: u64 = 4 * 60 * 60;
 
 pub enum BlobMessage {
     // src: the bridge
+    // to gather blob from remote nodes
     GetBlob {
         id: String,
-        // tx_reply: oneshot::Sender<Option<Bytes>>
     },
     // src: the bridge
     NewBlob {
@@ -56,12 +57,25 @@ pub enum BlobMessage {
     }
 }
 
-struct Blob {
-    root_hash: Hash,
-    data: Bytes,
-    chunks: HashMap<Hash, Bytes>,
-    merkle_tree: MerkleTree::<Blake3Hash>,
-    created_at: Instant,
+// evolution of remote blobs
+enum Status {
+    AwaitingMetadata,
+    Inflight
+}
+
+enum Blob {
+    LocalBlob {
+        root_hash: Hash,
+        data: Bytes,
+        chunks: HashMap<Hash, Bytes>,
+        merkle_tree: MerkleTree::<Blake3Hash>,
+        created_at: Instant,
+    },
+    RemoteBlob {
+        pull_status: Vec<(Status, Instant)>,
+        expected_chunk_hashes: Vec<Hash>,
+        chunks: HashMap<Hash, Bytes>,
+    }
 }
 
 struct BlobStore {
@@ -69,17 +83,17 @@ struct BlobStore {
 }
 
 impl BlobStore {
-    pub fn new() -> Self {
+    fn new() -> Self {
         BlobStore {
             blobs: HashMap::new(),
         }
     }
 
-    pub fn add_blob(
+    fn add_local_blob(
         &mut self,
         id: String,
         data: Bytes,
-    ) -> Result<()> {
+    ) -> Result<(Hash, Vec<Hash>)> {
         if data.is_empty() {
             return Err(eyre!("Empty blob."));
         }
@@ -89,13 +103,12 @@ impl BlobStore {
         let chunks: Vec<(Hash, Bytes)> = data
             .chunks(CHUNK_SIZE)
             .map(|c| (blake3::hash(c).into(), data.slice_ref(c)))
-            .collect();        
-        let merkle_tree = MerkleTree::<Blake3Hash>::from_leaves(
-            &chunks
-                .iter()
-                .map(|(hash, _)| hash.clone())
-                .collect::<Vec<Hash>>()
-        );
+            .collect();
+        let chunk_hashes = chunks
+            .iter()
+            .map(|(hash, _)| hash.clone())
+            .collect::<Vec<Hash>>();
+        let merkle_tree = MerkleTree::<Blake3Hash>::from_leaves(&chunk_hashes);
         let root_hash = merkle_tree
             .root()
             .ok_or_else(|| eyre!("Couldn't get the merkle root."))?;        
@@ -106,7 +119,7 @@ impl BlobStore {
         );
         self.blobs.insert(
             id.clone(), 
-            Blob {
+            Blob::LocalBlob {
                 root_hash,
                 data,
                 chunks: chunks.into_iter().collect(),
@@ -115,35 +128,27 @@ impl BlobStore {
             }
         );
 
-        Ok(())
+        Ok((root_hash, chunk_hashes))
     }
 
-    pub fn archive_blob(&mut self, id: &str) -> Result<()> {
+    fn archive_blob(&mut self, id: &str) -> Result<()> {
         let blob = self.blobs.remove(id).unwrap();
         // todo: archive blob meta
-        // {
-        //     const BASE_PATH: &str = "./blobs";
-        //     let blob_path = format!("{BASE_PATH}/{id}");
-        //     info!("Archiving blob(`{}`) to `{}`", id, blob_path);
-        //     let should_create = match fs::exists(BASE_PATH) {
-        //         Err(_) => true,
-        //         Ok(exists) => !exists
-        //     };
-        //     if should_create {
-        //         fs::create_dir(BASE_PATH)?;
-        //     }
-        //     let _ = fs::write(&blob_path, blob.data.as_ref())?;
-        // }
         Ok(())
     }
 
     // periodic cleanup
-    pub fn remove_stale_blobs(
+    fn remove_stale_blobs(
         &mut self
     ) {
         let now = Instant::now();
         self.blobs.retain(|_, blob| {
-            now.duration_since(blob.created_at).as_secs() < BLOB_LIFETIME
+            match blob {
+                Blob::LocalBlob { created_at, .. } => {
+                    now.duration_since(*created_at).as_secs() < BLOB_LIFETIME
+                }
+                Blob::RemoteBlob { .. } => true
+            }
         });        
         // todo: inform the bridge?
     }
@@ -158,6 +163,7 @@ pub async fn run(
     let mut blob_store = BlobStore::new();
     // to remove stale blobs
     let mut timer_stale_blobs = interval(Duration::from_secs(60));
+
     let jh = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -172,20 +178,37 @@ pub async fn run(
 
                 m = rx_blob.recv() =>  match m {
                     Some(bm) => match bm {
+                        // remote blob: download chunks and assemble 
                         BlobMessage::GetBlob { id } => {
-                            // todo
-
+                            if let Some(Blob::LocalBlob { data, .. }) = blob_store.blobs.get(&id) {
+                                
+                            } else {
+                                info!("Blob(`{}`) is missing, scheduled for gathering from remote nodes.", id);
+                                blob_store.blobs.insert(id.clone(),
+                                    Blob::RemoteBlob {
+                                        pull_status: vec![(Status::AwaitingMetadata, Instant::now())],
+                                        expected_chunk_hashes: vec![],
+                                        chunks: HashMap::new(),
+                                    }
+                                );
+                                if let Err(e) = tx_coord.send(CoordMessage::GatherBlob { id }).await {
+                                    warn!("Failed to notify the Coordinator about the new remote blob: {:?}", e);
+                                    // todo: retry or it'll stay AwaitingMetada forever
+                                    continue
+                                }
+                            }
                         }
+                        // local blob: to be chunked and distributed
                         BlobMessage::NewBlob { id, data } => {
-                            match blob_store.add_blob(id.clone(), data) {
-                                Ok(_) => {
+                            match blob_store.add_local_blob(id.clone(), data) {
+                                Ok((root_hash, chunk_hashes)) => {
                                     let blob = blob_store.blobs.get(&id).unwrap();
                                     if let Err(e) = tx_coord.send(CoordMessage::DistributeBlob {
                                         id: id.clone(),
-                                        root_hash: blob.root_hash,
-                                        chunk_hashes: blob.chunks.keys().cloned().collect()
+                                        root_hash,
+                                        chunk_hashes
                                     }).await {
-                                        warn!("Failed to notify the Coordinator about the new blob: {:?}", e);
+                                        warn!("Failed to notify the Coordinator about the new local blob: {:?}", e);
                                         // todo: retry or it'll stay pending forever
                                         continue
                                     }
@@ -194,7 +217,7 @@ pub async fn run(
                                     warn!("Add blob error: {:?}", add_err);
                                     if let Err(e) = tx_bridge.send(BridgeMessage::UpdateStatus {
                                         id,
-                                        status: Status::Failed { reason: Some(add_err.to_string()) }
+                                        status: BridgeStatus::Failed { reason: Some(add_err.to_string()) }
                                     }).await {
                                         warn!("Failed to notify the Bridge about this error: {:?}", e);
                                     }
@@ -209,25 +232,25 @@ pub async fn run(
                             tx_reply
                         } => {
                             let Some(blob) = blob_store.blobs.get(&id) else {
+                                warn!("No such blob(`{}`) to get chunks of.", id);
                                 if let Err(e) = tx_reply.send(None) {
-                                    warn!(
-                                        "Failed to notify(reply) the Coordinator about the missing blob(`{}`): {:?}",
-                                        id,
-                                        e
-                                    );
+                                    warn!("Failed to notify the Coordinator about the missing blob: {e:?}");
                                 }
                                 continue
                             };
-                            let chunks: HashMap<Hash, Option<Bytes>> = requested_chunks
-                                .into_iter()
-                                .map(|hash| (hash, blob.chunks.get(&hash).cloned()))
-                                .collect();
-                            if let Err(e) = tx_reply.send(Some(chunks)) {
-                                warn!(
-                                    "Failed to reply blob(`{}`) chunks to the Coordinator: {:?}",
-                                    id,
-                                    e
-                                );
+                            if let Blob::LocalBlob { chunks, .. } = blob {
+                                let chunks: HashMap<Hash, Option<Bytes>> = requested_chunks
+                                    .into_iter()
+                                    .map(|hash| (hash, chunks.get(&hash).cloned()))
+                                    .collect();
+                                if let Err(e) = tx_reply.send(Some(chunks)) {
+                                    warn!("Failed to reply blob(`{}`) chunks to the Coordinator: {:?}", id, e);
+                                }
+                            } else {
+                                warn!("Blob(`{}`) whose chunks are requested is of `remote` kind.", id);
+                                if let Err(e) = tx_reply.send(None) {
+                                    warn!("Failed to notify the Coordinator about this incident: {e:?}");
+                                }
                             }
                         }
                         BlobMessage::StoreResult {
@@ -256,7 +279,7 @@ pub async fn run(
                                 };
                                 if let Err(e) = tx_bridge.send(BridgeMessage::UpdateStatus {
                                     id,
-                                    status: Status::Finalized
+                                    status: BridgeStatus::Finalized
                                 }).await {
                                     warn!("Failed to notify the Bridge about the finalized state of blob: {:?}", e);
                                 }
@@ -270,7 +293,7 @@ pub async fn run(
                                 );
                                 if let Err(e) = tx_bridge.send(BridgeMessage::UpdateStatus {
                                     id,
-                                    status: Status::Failed { reason }
+                                    status: BridgeStatus::Failed { reason }
                                 }).await {
                                     warn!("Failed to notify the Bridge about the failed state of the blob: {:?}", e);
                                 }
@@ -286,4 +309,22 @@ pub async fn run(
         }
     });
     Ok(jh)
+}
+
+async fn dump_blob_to_disk(
+    id: &str,
+    data: Bytes
+) -> Result<()> {
+    const BASE_PATH: &str = "./blobs";
+    let blob_path = format!("{BASE_PATH}/{id}");
+    info!("Archiving blob(`{}`) to `{}`", id, blob_path);
+    let should_create = match fs::exists(BASE_PATH) {
+        Err(_) => true,
+        Ok(exists) => !exists
+    };
+    if should_create {
+        fs::create_dir(BASE_PATH)?;
+    }
+    let _ = fs::write(&blob_path, data.as_ref())?;
+    Ok(())
 }
