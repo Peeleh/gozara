@@ -6,9 +6,8 @@ use eyre::Result;
 use tracing::{info, warn};
 use serde::Serialize;
 use tokio::{
-    fs::File,
     task::JoinHandle,
-    sync::{mpsc, oneshot},
+    sync::mpsc,
 };
 use tokio_util::{
     sync::CancellationToken,
@@ -31,7 +30,7 @@ use dashmap::{
     DashMap,
     mapref::entry::Entry
 };
-use crate::blob_store::BlobMessage;
+use crate::coordinator::Message as CoordMessage;
 
 // 1 GiB
 const MAX_BLOB_SIZE: usize = 1 * 1024 * 1024 * 1024;
@@ -55,7 +54,7 @@ struct TimestampedStatus {
     status: Status,
 }
 
-pub enum BridgeMessage {
+pub enum Message {
     UpdateStatus {
         id: String,
         status: Status
@@ -65,14 +64,14 @@ pub enum BridgeMessage {
 #[derive(Clone)]
 pub struct BridgeState {
     status_map: Arc<DashMap<String, Vec<TimestampedStatus>>>,
-    tx_blob: mpsc::Sender<BlobMessage>,
+    tx_coord: mpsc::Sender<CoordMessage>,
 }
 
 impl BridgeState {
-    pub fn new(tx_blob: mpsc::Sender<BlobMessage>) -> Self {
+    pub fn new(tx_coord: mpsc::Sender<CoordMessage>) -> Self {
         BridgeState {
             status_map: Arc::new(DashMap::new()),
-            tx_blob
+            tx_coord
         }
     }
 }
@@ -105,20 +104,20 @@ async fn get_blob(
             //     .oneshot(req)
             //     .await
             //     .into_response()
-            StatusCode::TOO_EARLY.into_response()
+            StatusCode::ACCEPTED.into_response()
         }
         Status::Missing => {
-            if let Err(e) = state.tx_blob.send(BlobMessage::GetBlob {
+            if let Err(e) = state.tx_coord.send(CoordMessage::GetBlob {
                 id: id.clone(),
             }).await {
                 warn!("Failed to send the get blob message to the blob store: {e:?}");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
 
-            StatusCode::TOO_EARLY.into_response()
+            StatusCode::ACCEPTED.into_response()
         }
         _  => {
-            (StatusCode::TOO_EARLY, Json(status.clone())).into_response()
+            (StatusCode::ACCEPTED, Json(status.clone())).into_response()
         }
     }
 }
@@ -129,7 +128,7 @@ async fn new_blob(
     body: Bytes
 ) -> impl IntoResponse {
     info!(
-        "Received a new blob(`{}`) ~{}MB from the artifact store.",
+        "Received a new blob(`{}`) ~{:.1}MiB from the artifact store.",
         id, 
         body.len() as f32 / 1_048_576f32
     );
@@ -147,41 +146,36 @@ async fn new_blob(
         }
     }
 
-    if let Err(e) = state.tx_blob.send(
-        BlobMessage::NewBlob {
+    if let Err(e) = state.tx_coord.send(
+        CoordMessage::NewBlob {
             id: id.clone(),
             data: body
     }).await {
         warn!("Failed to send the new blob to the blob store: {e:?}");
+        let _ = state.status_map.remove(&id);
         return StatusCode::INTERNAL_SERVER_ERROR
     }
     StatusCode::CREATED
 }
 
 pub async fn run(
-    mut rx_bridge: mpsc::Receiver<BridgeMessage>,
-    tx_blob: mpsc::Sender<BlobMessage>,
+    mut rx_bridge: mpsc::Receiver<Message>,
+    tx_coord: mpsc::Sender<CoordMessage>,
     shutdown: CancellationToken
 ) -> Result<JoinHandle<()>> {
-    let state = BridgeState::new(tx_blob);
+    let state = BridgeState::new(tx_coord);
     let state_server = state.clone();
     let shutdown_bridge = shutdown.clone();
-    let mut server_jh = tokio::spawn(async move {
-        let app = Router::new()
-            .route("/status/{id}", get(get_status))   
-            .route("/blob/{id}", post(new_blob)
-                .layer(ConcurrencyLimitLayer::new(TOTAL_INBOUND_BLOB_PRESSURE))
-            )
-            .with_state(state_server)
-            .layer(DefaultBodyLimit::max(MAX_BLOB_SIZE));
+    let app = Router::new()
+        .route("/status/{id}", get(get_status))
+        .route("/blob/{id}", post(new_blob)
+            .layer(ConcurrencyLimitLayer::new(TOTAL_INBOUND_BLOB_PRESSURE))
+        )
+        .with_state(state_server)
+        .layer(DefaultBodyLimit::max(MAX_BLOB_SIZE));
 
-        let listener = match tokio::net::TcpListener::bind("127.0.0.1:8709").await {
-            Ok(l) => l,
-            Err(e) => {
-                warn!("Listener bind error: {:?}", e);
-                return
-            }
-        };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8709").await?;
+    let mut server_jh = tokio::spawn(async move {
         info!("Artifact store HTTP bridge is up and listening on port 8709.");
         if let Err(e) = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_bridge.cancelled_owned())
@@ -202,7 +196,7 @@ pub async fn run(
                 m = rx_bridge.recv() => match m {
                     Some(b_msg) => {
                         match b_msg {
-                            BridgeMessage::UpdateStatus {
+                            Message::UpdateStatus {
                                 id,
                                 status
                             } => {

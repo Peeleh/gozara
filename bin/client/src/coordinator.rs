@@ -3,19 +3,31 @@ use std::{
     collections::{VecDeque, HashMap},
     sync::Arc,
 };
-use eyre::{Result};
-use tracing::{info, warn};
+use eyre::{eyre, Result};
+use tracing::{info, warn, trace};
 use tokio::{
     sync::{mpsc, oneshot, Semaphore},
     time::interval,
-    task::JoinHandle
+    task,
 };
 use tokio_util::sync::CancellationToken;
 use bytes::Bytes;
 use libp2p::PeerId;
-use crate::blob_store::{Hash, BlobMessage} ;
-use crate::blob_transfer;
-use peyk::{HandlerMessage, SwarmMessage};
+use rs_merkle::MerkleTree;
+use crate::bridge::{
+    Message as BridgeMessage,
+    Status as BridgeStatus
+};
+use crate::blake3_wrapper::Blake3Hash;
+use peyk::{blob_transfer, HandlerMessage, SwarmMessage};
+
+pub type Hash = [u8; 32];
+
+// 4 MB
+const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+// blob lifetime: 4 hours
+const BLOB_LIFETIME: u64 = 4 * 60 * 60;
 
 // max incoming(network) blob size 8 MiB
 const MAX_BLOB_SIZE: usize = 8 * 1024 * 1024;
@@ -24,21 +36,24 @@ const CHUNK_UPLOAD_WINDOW: u64 = 30;
 // provider hints are valid for 5 minutes
 const STORAGE_PROVIDER_DECAY: u64 = 5 * 60;
 
-pub enum CoordMessage {
-    DistributeBlob {
+pub enum Message {
+    // src: the bridge
+    // to gather blob from remote nodes
+    GetBlob {
         id: String,
-        root_hash: Hash,
-        chunk_hashes: Vec<Hash>,
     },
-    GatherBlob {
+    // src: the bridge
+    NewBlob {
         id: String,
-    } 
+        data: Bytes,
+    }
 }
 
 enum InternalMessage {
     UpdateChunkStatus {
         hash: Hash,
-        new_status: ChunkUploadStatus
+        status: ChunkUploadStatus,
+        at: Instant
     }
 }
 
@@ -46,61 +61,82 @@ enum InternalMessage {
 enum ChunkUploadStatus {
     Pending,
     Inflight {
-        created_at: Instant,
         to: PeerId,
     },
     Finalized {
-        at: Instant,
         owner: PeerId
     }
 }
 
-struct StorageDeal {
-    id: String,
-    root_hash: Hash,
-    chunks: HashMap<Hash, ChunkUploadStatus>,
+struct TimestampedStatus {
+    at: Instant,
+    status: ChunkUploadStatus
 }
 
-impl StorageDeal {
-    pub fn is_finalized(&self) -> bool {
-        self.chunks
-            .values()
-            .all(|status| matches!(*status, ChunkUploadStatus::Finalized { .. }))
+struct Chunk {
+    data: Bytes,
+    status: TimestampedStatus
+}
+
+enum Blob {
+    LocalBlob {
+        id: String,
+        root_hash: Hash,
+        data: Bytes,
+        chunks: HashMap<Hash, Chunk>,
+        merkle_tree: MerkleTree::<Blake3Hash>,
+        created_at: Instant,
+    },
+    RemoteBlob {
+        id: String,
+        // pull_status: Vec<(DownloadStatus, Instant)>,
+        expected_chunk_hashes: Vec<Hash>,
+        chunks: HashMap<Hash, Bytes>,
     }
 }
 
+impl Blob {
+    async fn archive(&self) -> Result<()> {
+        // todo
+        Ok(())
+    }
+}
+
+
 struct Pipeline {
-    // record WouldStore gossips
+    pending_blobs: VecDeque<Blob>,
+    current_blob: Option<Blob>,
+
+    // record decaying WouldStore gossips
     storage_provider_hints: HashMap<PeerId, Instant>,
     storage_permits: HashMap<PeerId, Instant>,
-    pending_storage_deals: VecDeque<StorageDeal>,
-    active_storage_deal: Option<StorageDeal>,
+
     tx_internal: mpsc::UnboundedSender<InternalMessage>,
+
     tx_swarm: mpsc::Sender<SwarmMessage>,
-    tx_blob: mpsc::Sender<BlobMessage>,
+
     blob_transfer_control: libp2p_stream::Control,
     tx_blob_transfer_events: mpsc::UnboundedSender<blob_transfer::TransferEvent>,
+
     // to gate i/o usage
     download_allowance: Arc<Semaphore>,
-    upload_allowance: Arc<Semaphore>,
+    upload_allowance: Arc<Semaphore>
 }
 
 impl Pipeline {
     pub fn new(
         tx_internal: mpsc::UnboundedSender<InternalMessage>,
         tx_swarm: mpsc::Sender<SwarmMessage>,
-        tx_blob: mpsc::Sender<BlobMessage>,
         blob_transfer_control: libp2p_stream::Control,
         tx_blob_transfer_events: mpsc::UnboundedSender<blob_transfer::TransferEvent>
     ) -> Self {
         Pipeline {
+            pending_blobs: VecDeque::new(),
+            current_blob: None,
             storage_provider_hints: HashMap::new(),
             storage_permits: HashMap::new(),
-            pending_storage_deals: VecDeque::new(),
-            active_storage_deal: None,
             tx_internal,
             tx_swarm,
-            tx_blob,
             blob_transfer_control,
             tx_blob_transfer_events,
             download_allowance: Arc::new(Semaphore::new(32)), // 32 * 4 = 128 MiB of downloads
@@ -108,21 +144,97 @@ impl Pipeline {
         }
     }
 
-    pub async fn add_new_deal(
+    async fn add_local_blob(
         &mut self,
         id: String,
-        root_hash: Hash,
-        chunk_hashes: Vec<Hash>
+        data: Bytes,
+    ) -> Result<()> {
+        if data.is_empty() {
+            return Err(eyre!("Empty blob."))
+        }
+        // todo: also check with the archived blobs
+        if self.pending_blobs
+            .iter()
+            .any(|blob| match blob {
+                Blob::LocalBlob { id: ex_id, .. } => *ex_id == id,
+                Blob::RemoteBlob { id: ex_id, .. } => *ex_id == id,
+            })
+        {
+            return Err(eyre!("Duplicate blob: {}", id))
+        }
+        let is_duplicate = match self.current_blob.as_ref() {
+            Some(blob) => match blob {
+                Blob::LocalBlob { id: ex_id, .. } => *ex_id == id,
+                Blob::RemoteBlob { id: ex_id, .. } => *ex_id == id,
+            }
+            None => false
+        };
+        if is_duplicate {
+            return Err(eyre!("Duplicate blob: {}", id))
+        }
+
+        let cloned_data = data.clone();
+        let (chunks, merkle_tree) = task::spawn_blocking(move || {
+            let chunks: Vec<(Hash, Chunk)> = cloned_data
+                .chunks(CHUNK_SIZE)
+                .map(|c| (
+                    blake3::hash(c).into(),
+                    Chunk {
+                        data: cloned_data.slice_ref(c),
+                        status: TimestampedStatus {
+                            at: Instant::now(),
+                            status: ChunkUploadStatus::Pending,
+                        }
+                    }
+                )).collect();            
+            let chunk_hashes = chunks
+                .iter()
+                .map(|(hash, _)| *hash)
+                .collect::<Vec<Hash>>();
+            let merkle_tree = MerkleTree::<Blake3Hash>::from_leaves(&chunk_hashes);
+
+            (chunks, merkle_tree)
+        }).await?;
+        let root_hash = merkle_tree
+            .root()
+            .ok_or_else(|| eyre!("Couldn't get the merkle root."))?;
+        info!(
+            "Blob(`{}`) is chunked and Merklized with root hash(`{}`). We'll now try to distribute it.",
+            id, hex::encode(root_hash)
+        );
+        self.pending_blobs.push_back(
+            Blob::LocalBlob {
+                id,
+                root_hash,
+                data,
+                chunks: chunks.into_iter().collect(),
+                merkle_tree,
+                created_at: Instant::now()
+            }
+        );
+        Ok(())
+    }
+
+    fn archive_cur_blob(&mut self) -> Result<()> {
+        let _blob = self.current_blob.take().unwrap();
+        // todo: archive the blob
+        Ok(())
+    }
+
+    // periodic cleanup
+    fn remove_stale_blobs(
+        &mut self
     ) {
-        self.pending_storage_deals.push_back(StorageDeal {
-            id,
-            root_hash,
-            chunks: chunk_hashes
-                .into_iter()
-                .map(|h| (h, ChunkUploadStatus::Pending))
-                .collect()
-        });
-        self.begin_next_deal().await;
+        // let now = Instant::now();
+        // self.blobs.retain(|_, blob| {
+        //     match blob {
+        //         Blob::LocalBlob { created_at, .. } => {
+        //             now.duration_since(*created_at).as_secs() < BLOB_LIFETIME
+        //         }
+        //         Blob::RemoteBlob { .. } => true
+        //     }
+        // });
+        // todo: inform the bridge?
     }
 
     pub async fn request_storage_permits(&mut self) {
@@ -140,56 +252,57 @@ impl Pipeline {
         if let Err(e) = self.tx_swarm.send(SwarmMessage::RequestStoragePermits {
             peers: self.storage_provider_hints.keys().cloned().collect()
         }).await {
-            warn!(
-                "Failed to request a fresh storage permits: {:?}",
-                e
-            );
+            warn!("Failed to request a fresh storage permits: {e:?}");
             // todo: retry with backoff
         } else {
-            info!("Requested a fresh storage permit for the active deal.");
+            info!("Requested a fresh set of storage permit.");
         }
     }
 
-    pub async fn begin_next_deal(&mut self) {
-        if self.active_storage_deal.is_none() {
-            self.active_storage_deal = self.pending_storage_deals.pop_front();
-            if let Some(deal) = self.active_storage_deal.as_ref() {
-                info!(
-                    "A new deal(`{}`) has begun.",
-                    deal.id
-                );
+    pub async fn begin_next_blob(&mut self) {
+        if self.current_blob.is_some() {
+            return
+        }
+        self.current_blob = self.pending_blobs.pop_front();
+        if let Some(blob) = self.current_blob.as_ref() {
+            if let Blob::LocalBlob { id, .. } = blob {
+                info!("Started to distribute a new local blob(`{}`).", id);
                 self.request_storage_permits().await;
-            } else {
-                info!("All deals are caught up. Waiting for the next...");
             }
+        } else {
+            info!("All blobs are caught up. Waiting for the next...");
         }
     }
 
     pub async fn assign_chunks(&mut self) {
-        if self.active_storage_deal.is_none() {
+        let num_available_permits = self.upload_allowance.available_permits();
+        if num_available_permits == 0 {
+            trace!("No upload allowance for now, cannot proceed with chunk assignment.");
             return
         }
-        if self.upload_allowance.available_permits() == 0 {
-            warn!("No upload allowance for now. So cannot proceed with chunk assignment.");
+        let Some(blob) = &mut self.current_blob else {
+            trace!("The current blob is invalid so chunk assignment won't proceed.");
             return
-        }
+        };
+        let Blob::LocalBlob { chunks, .. } = blob else {
+            trace!("Chunk assignment does not apply here as the current blob is of `remote` kind.");
+            return
+        };
         let now = Instant::now();
         let peers: Vec<PeerId> = self.storage_permits.keys().cloned().collect();
-        // skip already finalized chunks
-        let active_storage_deal = self.active_storage_deal.as_mut().unwrap();
-        let pending_chunks: Vec<_> = active_storage_deal
-            .chunks
+        if peers.is_empty() {
+            warn!("No peers to assign.");
+            return
+        }
+        let chosen_chunks: Vec<Hash> = chunks
             .iter()
-            .filter_map(|(h, upload_status)| {
-                match upload_status {
-                    ChunkUploadStatus::Pending => Some(*h),
-                    ChunkUploadStatus::Inflight {
-                        created_at,
-                        ..
-                    } => {
+            .filter_map(|(hash, chunk)| {
+                match chunk.status.status {
+                    ChunkUploadStatus::Pending => Some(hash),
+                    ChunkUploadStatus::Inflight { .. }  => {
                         // timed out
-                        if now.duration_since(*created_at).as_secs() > CHUNK_UPLOAD_WINDOW {
-                            Some(*h)
+                        if now.duration_since(chunk.status.at).as_secs() > CHUNK_UPLOAD_WINDOW {
+                            Some(hash)
                         } else {
                             None
                         }
@@ -197,144 +310,88 @@ impl Pipeline {
                     ChunkUploadStatus::Finalized { .. } => None
                 }
             })
+            .take(num_available_permits)
+            .cloned()
             .collect();
-        let chosen_chunks: Vec<Hash> = pending_chunks
-            .into_iter()
-            .take(self.upload_allowance.available_permits())
-            .collect();
-        let (tx, rx) = oneshot::channel::<Option<HashMap<Hash, Option<Bytes>>>>();
-        if let Err(e) = self.tx_blob.send(BlobMessage::FetchChunks {
-            id: active_storage_deal.id.clone(),
-            chunks: chosen_chunks,
-            tx_reply: tx,
-        }).await {
-            warn!(
-                "Failed to ask for chunks of blob(`{}`) from blob store: {}",
-                active_storage_deal.id,
-                e
+        let num_peers = peers.len();
+        let mut assignments = HashMap::<PeerId, Vec<(Hash, Bytes)>>::new();
+        let mut peer_index = 0;
+        for hash in chosen_chunks.into_iter() {
+            let peer = peers[peer_index];
+            assignments.entry(peer).or_default().push(
+                (hash, chunks.get(&hash).unwrap().data.clone())
             );
-            return
+            chunks.get_mut(&hash).unwrap().status = TimestampedStatus {
+                status: ChunkUploadStatus::Inflight { to: peer },
+                at: now
+            };
+            peer_index = (peer_index + 1) % num_peers;
         }
-        info!(
-            "Requested some chunks of blob (`{}`).",
-            active_storage_deal.id
-        );
-        match rx.await {
-            Ok(r) => {
-                let Some(chunks) = r else {
-                    warn!("No chunks are available.");
-                    return
-                };
-                // todo: cry about `none` chunks
-                let chunks: Vec<(Hash, Bytes)> = chunks
-                    .into_iter()
-                    .filter_map(|(h, b)| if b.is_some() { Some((h, b.unwrap())) } else { None })
-                    .collect();
-                if chunks.is_empty() {
-                    warn!("Critical to assignment: requested chunks are missing.");
-                    return
-                }
-                if peers.is_empty() {
-                    warn!("Critical to assignment: no peers to assign.");
-                    return
-                }
-                let num_peers = peers.len();
-                let mut assignments: HashMap<PeerId, Vec<(Hash, Bytes)>> = HashMap::new();
-                let mut peer_index = 0;
-                let mut chunks_iter = chunks.into_iter();
-                while let Some(chunk) = chunks_iter.next() {
-                    assignments
-                        .entry(peers[peer_index])
-                        .or_default()
-                        .push(chunk);
-                    peer_index = (peer_index + 1) % num_peers;
-                }
-                // upload chunks                 
-                for (peer, asses) in assignments.into_iter() {
-                    for (hash, data) in asses.into_iter() {
-                        let control = self.blob_transfer_control.clone();
-                        let upload_allowance = self.upload_allowance.clone();
-                        let tx_events = self.tx_blob_transfer_events.clone();
-                        // self send for maintenance and state propagation
-                        let tx_internal = self.tx_internal.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = upload_allowance.acquire_owned().await {
-                                warn!(
-                                    "Could not get allowance from the semaphore to begin upload: {:?}",
-                                    e
-                                );
-                                return
-                            }
-                            let hash_str = hex::encode(hash);
-                            // upload initiated
-                            if let Err(e) = tx_internal.send(InternalMessage::UpdateChunkStatus {
-                                hash,
-                                new_status: ChunkUploadStatus::Inflight {
-                                    created_at: Instant::now(),
-                                    to: peer
-                                }
-                            }) {
-                                warn!(
-                                    "Could not notify the coordinator about an inflight upload for chunk(`{}`): {:?}",
-                                    hash_str,
-                                    e
-                                );
-                            }
-                            if let Err(e) = blob_transfer::push(
-                                control,
-                                peer,
-                                hash_str.clone(),
-                                data,
-                                tx_events
-                            ).await {
-                                warn!(
-                                    "Push blob(`{}`) to Peer(`{}`) failed: {}",
-                                    hash_str,
-                                    peer,
-                                    e
-                                );
-                                // keep it at inflight to simulate backoff
-                                return
-                            }
-                            // upload succeeded
-                            info!(
-                                "Blob(`{}`) has been successfully transferred to Peer(`{}`).",
-                                hash_str,
-                                peer
-                            );
-                            if let Err(e) = tx_internal.send(InternalMessage::UpdateChunkStatus {
-                                hash,
-                                new_status: ChunkUploadStatus::Finalized {
-                                    at: Instant::now(),
-                                    owner: peer
-                                }
-                            }) {
-                                warn!(
-                                    "Could not notify the coordinator about an completed upload for chunk(`{}`): {:?}",
-                                    hash_str,
-                                    e
-                                );
-                            }                            
-                        });
+        // upload chunks
+        for (peer, batch) in assignments.into_iter() {
+            for (hash, data) in batch.into_iter() {
+                let control = self.blob_transfer_control.clone();
+                let upload_allowance = self.upload_allowance.clone();
+                let tx_events = self.tx_blob_transfer_events.clone();
+                // self send for maintenance and state propagation
+                let tx_internal = self.tx_internal.clone();
+                tokio::spawn(async move {
+                    let _permit = match upload_allowance.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!("Could not get upload allowance: {e:?}");
+                            return
+                        }
+                    };
+                    let hash_str = hex::encode(hash);
+                    // upload initiates
+                    if let Err(e) = blob_transfer::push(
+                        control,
+                        peer,
+                        hash_str.clone(),
+                        data,
+                        tx_events
+                    ).await {
+                        warn!(
+                            "Push blob(`{}`) to Peer(`{}`) failed: {}",
+                            hash_str,
+                            peer,
+                            e
+                        );
+                        // keep it at inflight to simulate backoff
+                        return
                     }
-                }
-                
-            },
-            Err(_) => {
-                warn!("Reply channel for chunks is closed.");
+                    // upload succeeded
+                    info!(
+                        "Blob(`{}`) has been successfully transferred to Peer(`{}`).",
+                        hash_str,
+                        peer
+                    );
+                    if let Err(e) = tx_internal.send(InternalMessage::UpdateChunkStatus {
+                        hash,
+                        status: ChunkUploadStatus::Finalized { owner: peer },
+                        at: Instant::now(),
+                    }) {
+                        warn!(
+                            "Could not notify the coordinator about an completed upload for chunk(`{}`): {:?}",
+                            hash_str,
+                            e
+                        );
+                    }
+                });
             }
-        };
+        }
     }
 }
 
 pub async fn run(
-    mut rx_coord: mpsc::Receiver<CoordMessage>,
+    mut rx_coord: mpsc::Receiver<Message>,
     mut rx_handler: mpsc::Receiver<HandlerMessage>,
     tx_swarm: mpsc::Sender<SwarmMessage>,
-    tx_blob: mpsc::Sender<BlobMessage>,
+    tx_bridge: mpsc::Sender<BridgeMessage>,
     mut blob_transfer_control: libp2p_stream::Control,
     shutdown: CancellationToken,
-) -> Result<JoinHandle<()>> {
+) -> Result<task::JoinHandle<()>> {
     //  setup blob transfer
     let mut incoming_pushes = blob_transfer::accept_pushes(
         blob_transfer_control.accept(blob_transfer::PUSH_PROTOCOL)?,
@@ -349,11 +406,10 @@ pub async fn run(
     let mut pipeline = Pipeline::new(
         tx_internal,
         tx_swarm,
-        tx_blob.clone(),
         blob_transfer_control,
         tx_blob_transfer_events
     );
-    let mut timer_stale_providers = interval(Duration::from_secs(60));
+    let mut timer_stale = interval(Duration::from_secs(60));
     let mut timer_assign = interval(Duration::from_secs(30));
     let jh = tokio::spawn(async move {
         loop {
@@ -363,15 +419,16 @@ pub async fn run(
                     break
                 },
 
-                _i = timer_stale_providers.tick() => {
+                _i = timer_stale.tick() => {
                     pipeline
                         .storage_provider_hints
                         .retain(|_, created_at| {
                             Instant::now().duration_since(*created_at).as_secs() < STORAGE_PROVIDER_DECAY
                         });
-                    if pipeline.active_storage_deal.is_some() {
+                    if pipeline.current_blob.is_some() {
                         pipeline.request_storage_permits().await;
                     }
+                    // pipeline.remove_stale_blobs();
                 },
 
                 _i = timer_assign.tick() => {
@@ -381,7 +438,7 @@ pub async fn run(
                 hm = rx_handler.recv() => match hm {
                     Some(h_msg) => {
                         match h_msg {
-                            // a gossip by storer nodes
+                            // a gossip by storage providers
                             HandlerMessage::WouldStore {
                                 peer_id,
                             } => {
@@ -410,7 +467,8 @@ pub async fn run(
                                                 Duration::from_secs(valid_for as u64)
                                             ).unwrap_or_else(|| now)
                                         );
-                                        // todo: storage permit is already invalid
+                                        // todo: storage permit is already invalid in case of overflow
+                                        pipeline.assign_chunks().await;
                                     }
                                     peyk::protocol::Response::BlobMeta {..} => {}
                                 }
@@ -422,84 +480,103 @@ pub async fn run(
                         break
                     }
                 },
-                // coordination messages
-                cm = rx_coord.recv() => match cm {
-                    Some(c_msg) => {
-                        match c_msg {
-                            CoordMessage::DistributeBlob {
-                                id,
-                                root_hash,
-                                chunk_hashes
-                            } => {              
-                                pipeline.add_new_deal(id, root_hash, chunk_hashes).await;
+                // messages
+                m = rx_coord.recv() => match m {
+                    Some(msg) => match msg {
+                        // remote blob: download chunks and assemble 
+                        Message::GetBlob { id } => {
+                            if let Some(Blob::LocalBlob { .. }) = pipeline.current_blob {
+                                // todo
+                            } else {
+                                info!("Blob(`{}`) is missing, scheduled for gathering from remote nodes.", id);
+                                pipeline.pending_blobs.push_back(
+                                    Blob::RemoteBlob {
+                                        id: id.clone(),
+                                        // pull_status: vec![(Status::AwaitingMetadata, Instant::now())],
+                                        expected_chunk_hashes: vec![],
+                                        chunks: HashMap::new(),
+                                    }
+                                );
                             }
-                            CoordMessage::GatherBlob {..}=> {}
+                        }
+                        // local blob: chunk and distribute
+                        Message::NewBlob { id, data } => {
+                            match pipeline.add_local_blob(id.clone(), data).await {
+                                Ok(_) => {
+                                    pipeline.begin_next_blob().await;
+                                }
+                                Err(add_err) => {
+                                    warn!("Add local blob error: {:?}", add_err);
+                                    if let Err(e) = tx_bridge.send(BridgeMessage::UpdateStatus {
+                                        id,
+                                        status: BridgeStatus::Failed { reason: Some(add_err.to_string()) }
+                                    }).await {
+                                        warn!("Failed to notify the Bridge about this error: {:?}", e);
+                                    }
+                                    // todo: retry
+                                    continue
+                                }
+                            }
                         }
                     }
                     None => {
-                        warn!("Coordination channel is closed.");
+                        warn!("Message channel is closed.");
                         break
                     }
                 },
-                // internal message
+                // internal messages
                 im = rx_internal.recv() => match im {
-                    Some(i_msg) => {
-                        match i_msg {
-                            InternalMessage::UpdateChunkStatus {
-                                hash,
-                                new_status
-                            } => {
-                                let hash_str = hex::encode(hash);
-                                let Some(active_storage_deal) = pipeline.active_storage_deal.as_mut() else {
-                                    warn!(
-                                        "New chunk status update(`{}`) for chunk(`{:?}`) but the active storage deal is invalid.",
-                                        hash_str,
-                                        new_status
-                                    );
-                                    continue
-                                };
-                                let Some(chunk_status) = active_storage_deal.chunks.get_mut(&hash) else {
-                                    warn!(
-                                        "Unsolicited new status update(`{}`) for Chunk(`{:?}`).",
-                                        hash_str,
-                                        new_status                                        
-                                    );
-                                    continue
-                                };
-                                // todo: check if the new status is > the older
-                                *chunk_status = new_status.clone();
-                                match new_status {
-                                    ChunkUploadStatus::Pending | ChunkUploadStatus::Inflight { .. } => {},
-                                    ChunkUploadStatus::Finalized {
-                                        at: _,
-                                        owner
-                                    } => {
-                                        info!(
-                                            "Chunk(`{}`) is successfully upload to peer(`{}`).",
-                                            hash_str,
-                                            owner
-                                        );
-                                        if active_storage_deal.is_finalized() {
-                                            match tx_blob.send(BlobMessage::StoreResult {
-                                                id: active_storage_deal.id.clone(),
-                                                success: true,
-                                                failure_reason: None
-                                            }).await {
-                                                Ok(_) => {
-                                                    pipeline.begin_next_deal().await;
-                                                }
-                                                Err(e) => 
-                                                    warn!(
-                                                        "Failed to notify blob store about global storage finalization: {:?}.",
-                                                        e
-                                                    )
-                                            }
+                    Some(i_msg) => match i_msg {
+                        InternalMessage::UpdateChunkStatus {
+                            hash,
+                            status,
+                            ..
+                        } => {
+                            let hash_str = hex::encode(hash);
+                            info!("A new chunk(`{}`) status update(`{:?}`)", hash_str, status);
+                            let Some(blob) = &mut pipeline.current_blob else {
+                                warn!("The current blob is invalid.");
+                                continue
+                            };
+                            let Blob::LocalBlob { id, chunks, .. } = blob else {
+                                trace!("The current blob is of `remote` kind.");
+                                continue
+                            };
+                            let Some(chunk) = chunks.get_mut(&hash) else {
+                                warn!("Chunk is missing.");
+                                continue
+                            };
+                            // todo: keep track of previous updates and test for healthy transition
+                            chunk.status = TimestampedStatus {
+                                at: Instant::now(),
+                                status: status.clone()
+                            };
+                            match status {
+                                ChunkUploadStatus::Pending => {},
+                                ChunkUploadStatus::Inflight { to } => {
+                                    info!("Chunk is being sent to Peer(`{}`).", to);
+                                },
+                                ChunkUploadStatus::Finalized { owner } => {
+                                    info!("Chunk has been successfully uploaded to peer(`{}`).", owner);
+                                    let is_finalized = chunks
+                                        .values()
+                                        .all(|chunk| matches!(chunk.status.status, ChunkUploadStatus::Finalized { .. }));
+                                    if is_finalized {
+                                        info!("Blob(`{}`) is now stored globally.", id);
+                                        if let Err(e) = tx_bridge.send(BridgeMessage::UpdateStatus {
+                                            id: id.to_string(),
+                                            status: BridgeStatus::Finalized
+                                        }).await {
+                                            warn!("Failed to notify the Bridge about the finalized state of blob: {:?}", e);
                                         }
-                                        // todo: when to notify it about failure?
+                                        let _ = pipeline.archive_cur_blob();
+                                        pipeline.begin_next_blob().await;
                                     }
-                                };
+                                    pipeline.assign_chunks().await;
+                                    // todo: when to notify it about failure?
+                                }
+                            };
 
-                            }
                         }
                     }
                     None => {
@@ -539,4 +616,16 @@ pub async fn run(
         }
     });
     Ok(jh)
+}
+
+async fn dump_blob_to_disk(
+    id: &str,
+    data: Bytes
+) -> Result<()> {
+    const BASE_PATH: &str = "./blobs";
+    let blob_path = format!("{BASE_PATH}/{id}");
+    info!("Archiving blob(`{}`) to `{}`", id, blob_path);
+    tokio::fs::create_dir_all(BASE_PATH).await?;
+    tokio::fs::write(&blob_path, data.as_ref()).await?;
+    Ok(())
 }

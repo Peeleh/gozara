@@ -1,5 +1,4 @@
 mod bridge;
-mod blob_store;
 mod blake3_wrapper;
 mod coordinator;
 
@@ -16,7 +15,6 @@ use libp2p::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use libp2p::swarm::Swarm;
-use peyk::blob_transfer;
 
 pub struct Config {
     pub grpc_addr: String,
@@ -129,14 +127,12 @@ pub async fn run(
     let blob_transfer_control = swarm.behaviour().blob_stream.new_control();
     let (tx_swarm, rx_swarm) = mpsc::channel::<peyk::SwarmMessage>(16);
     let (tx_handler, rx_handler) = mpsc::channel::<peyk::HandlerMessage>(256);
-    let (tx_coord, rx_coord) = mpsc::channel::<coordinator::CoordMessage>(256);
-    let (tx_blob, rx_blob) = mpsc::channel::<blob_store::BlobMessage>(4);
-    let (tx_bridge, rx_bridge) = mpsc::channel::<bridge::BridgeMessage>(256);
-    let (mut swarm_jh, mut coord_jh, mut blob_jh, mut bridge_jh) = tokio::try_join!(
+    let (tx_coord, rx_coord) = mpsc::channel::<coordinator::Message>(4);
+    let (tx_bridge, rx_bridge) = mpsc::channel::<bridge::Message>(128);
+    let (mut swarm_jh, mut coord_jh, mut bridge_jh) = tokio::try_join!(
         peyk::process_swarm(swarm, rx_swarm, tx_handler, shutdown.clone()),
-        coordinator::run(rx_coord, rx_handler, tx_swarm, tx_blob.clone(), blob_transfer_control, shutdown.clone()),
-        blob_store::run(rx_blob, tx_bridge, tx_coord, shutdown.clone()),
-        bridge::run(rx_bridge, tx_blob, shutdown.clone())
+        coordinator::run(rx_coord, rx_handler, tx_swarm, tx_bridge, blob_transfer_control, shutdown.clone()),
+        bridge::run(rx_bridge, tx_coord, shutdown.clone())
     )?;
     tokio::select! {
         r = &mut swarm_jh => {
@@ -152,14 +148,6 @@ pub async fn run(
             match r {
                 Ok(_) => Err(eyre!("Coordinator task exited unexpectedly.")),
                 Err(e) => Err(eyre!("Coordinator task panicked: {e:?}"))
-            }
-        },
-
-        r = &mut blob_jh => {
-           shutdown.cancel();
-            match r {
-                Ok(_) => Err(eyre!("Blob store task exited unexpectedly.")),
-                Err(e) => Err(eyre!("Blob store task panicked: {e:?}"))
             }
         },
 
