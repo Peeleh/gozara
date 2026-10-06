@@ -248,14 +248,9 @@ impl Pipeline {
             return
         }
         // todo: peers size should not be large
-        if let Err(e) = self.tx_swarm.send(SwarmMessage::RequestStoragePermits {
+        let _ = self.tx_swarm.send(SwarmMessage::RequestStoragePermits {
             peers: self.storage_provider_hints.keys().cloned().collect()
-        }).await {
-            warn!("Failed to request a fresh storage permits: {e:?}");
-            // todo: retry with backoff
-        } else {
-            info!("Requested a fresh set of storage permit.");
-        }
+        }).await;
     }
 
     pub async fn begin_next_blob(&mut self) {
@@ -322,9 +317,7 @@ impl Pipeline {
         for hash in chosen_chunks.into_iter() {
             let peer = peers[peer_index];
             let Ok(permit) = self.upload_allowance.clone().try_acquire_owned() else {
-                warn!("Could not get an upload permit for chunk(`{}`) -> to `{peer}` transfer.",
-                    hex::encode(hash)
-                );
+                warn!(%peer, hash = %hex::encode(hash), "Could not get an upload permit for transfer.");
                 break
             };
             assignments.entry(peer).or_default().push((
@@ -348,9 +341,7 @@ impl Pipeline {
                 let tx_internal = self.tx_internal.clone();
                 tokio::spawn(async move {
                     let hash_str = hex::encode(hash);
-                    info!("Chunk(`{hash_str}`) -> `{peer}` upload is initiated: length: `{:.1}` MiB",
-                        data.len() as f32 / 1_048_576f32
-                    );
+                    info!(chunk = %hash_str, %peer, length = data.len() as f32 / 1_048_576f32, "upload is initiated");
                     let upload_result = timeout(
                         Duration::from_secs(CHUNK_UPLOAD_WINDOW),
                         blob_transfer::push(control, peer, hash, data, tx_events)
@@ -358,8 +349,9 @@ impl Pipeline {
                     drop(permit);
                     match upload_result {
                         Ok(Ok(_)) => {
-                            info!("Chunk(`{hash_str}`) -> `{peer}` upload finished successfully in `{:.1} secs`.",
-                                upload_onset.elapsed().as_secs_f32()
+                            info!(chunk = %hash_str, %peer,
+                                dur = upload_onset.elapsed().as_secs_f32(),
+                                "upload finished successfully."
                             );
                             let _ = tx_internal.send(InternalMessage::UpdateChunkStatus {
                                 hash,
@@ -368,8 +360,9 @@ impl Pipeline {
                             });
                         }
                         Ok(Err(e)) => {
-                            warn!("Chunk(`{hash_str}`) -> `{peer}` upload failed after `{:.1} secs`: {e:?}",
-                                upload_onset.elapsed().as_secs_f32(),
+                            info!(chunk = %hash_str, %peer,
+                                dur = upload_onset.elapsed().as_secs_f32(),
+                                "upload failed."
                             );
                             let _ = tx_internal.send(InternalMessage::UpdateChunkStatus {
                                 hash,
@@ -379,7 +372,10 @@ impl Pipeline {
                             // mark the stalled peer as faulty and do not match again
                         }
                         Err(_) => {
-                            warn!("Chunk(`{hash_str}`) -> `{peer}` upload has timed out.");
+                            info!(chunk = %hash_str, %peer,
+                                dur = upload_onset.elapsed().as_secs_f32(),
+                                "upload has timed out."
+                            );
                         }
                     };
                 });
@@ -511,12 +507,10 @@ pub async fn run(
                                 }
                                 Err(add_err) => {
                                     warn!("Add local blob error: {:?}", add_err);
-                                    if let Err(e) = tx_bridge.send(BridgeMessage::UpdateStatus {
+                                    let _ = tx_bridge.send(BridgeMessage::UpdateStatus {
                                         id,
                                         status: BridgeStatus::Failed { reason: Some(add_err.to_string()) }
-                                    }).await {
-                                        warn!("Failed to notify the Bridge about this error: {:?}", e);
-                                    }
+                                    }).await;
                                     // todo: retry
                                     continue
                                 }
@@ -567,12 +561,10 @@ pub async fn run(
                                         .all(|chunk| matches!(chunk.status.status, ChunkUploadStatus::Finalized { .. }));
                                     if is_finalized {
                                         info!("Blob(`{}`) is now stored globally.", id);
-                                        if let Err(e) = tx_bridge.send(BridgeMessage::UpdateStatus {
+                                        let _ = tx_bridge.send(BridgeMessage::UpdateStatus {
                                             id: id.to_string(),
                                             status: BridgeStatus::Finalized
-                                        }).await {
-                                            warn!("Failed to notify the Bridge about the finalized state of blob: {:?}", e);
-                                        }
+                                        }).await;
                                         let _ = pipeline.archive_cur_blob();
                                         pipeline.begin_next_blob().await;
                                     }
