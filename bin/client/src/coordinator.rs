@@ -1,13 +1,12 @@
 use std::{
-    time::{Instant, Duration},
     collections::{VecDeque, HashMap},
     sync::Arc,
 };
 use eyre::{eyre, Result};
 use tracing::{info, warn, trace};
 use tokio::{
-    sync::{mpsc, oneshot, Semaphore},
-    time::interval,
+    sync::{mpsc, oneshot, Semaphore, OwnedSemaphorePermit},
+    time::{Instant, Duration, timeout, interval},
     task,
 };
 use tokio_util::sync::CancellationToken;
@@ -239,7 +238,7 @@ impl Pipeline {
 
     pub async fn request_storage_permits(&mut self) {
         if self.storage_provider_hints.is_empty() {
-            warn!("No storage providers to request permits from.");
+            warn!("No storage providers out there to request permits from.");
             return
         }
         let now = Instant::now();
@@ -289,9 +288,13 @@ impl Pipeline {
             return
         };
         let now = Instant::now();
-        let peers: Vec<PeerId> = self.storage_permits.keys().cloned().collect();
+        let peers: Vec<PeerId> = self.storage_permits
+            .iter()
+            .filter_map(|(peer, expires_at)| if *expires_at > now { Some(peer) } else { None })
+            .cloned()
+            .collect();
         if peers.is_empty() {
-            warn!("No peers to assign.");
+            warn!("No eligible peers to assign.");
             return
         }
         let chosen_chunks: Vec<Hash> = chunks
@@ -314,13 +317,22 @@ impl Pipeline {
             .cloned()
             .collect();
         let num_peers = peers.len();
-        let mut assignments = HashMap::<PeerId, Vec<(Hash, Bytes)>>::new();
+        let mut assignments = HashMap::<PeerId, Vec<(Hash, Bytes, OwnedSemaphorePermit, Instant)>>::new();
         let mut peer_index = 0;
         for hash in chosen_chunks.into_iter() {
             let peer = peers[peer_index];
-            assignments.entry(peer).or_default().push(
-                (hash, chunks.get(&hash).unwrap().data.clone())
-            );
+            let Ok(permit) = self.upload_allowance.clone().try_acquire_owned() else {
+                warn!("Could not get an upload permit for chunk(`{}`) -> to `{peer}` transfer.",
+                    hex::encode(hash)
+                );
+                break
+            };
+            assignments.entry(peer).or_default().push((
+                hash,
+                chunks.get(&hash).unwrap().data.clone(),
+                permit,
+                now
+            ));
             chunks.get_mut(&hash).unwrap().status = TimestampedStatus {
                 status: ChunkUploadStatus::Inflight { to: peer },
                 at: now
@@ -329,55 +341,47 @@ impl Pipeline {
         }
         // upload chunks
         for (peer, batch) in assignments.into_iter() {
-            for (hash, data) in batch.into_iter() {
+            for (hash, data, permit, upload_onset) in batch.into_iter() {
                 let control = self.blob_transfer_control.clone();
-                let upload_allowance = self.upload_allowance.clone();
                 let tx_events = self.tx_blob_transfer_events.clone();
                 // self send for maintenance and state propagation
                 let tx_internal = self.tx_internal.clone();
                 tokio::spawn(async move {
-                    let _permit = match upload_allowance.acquire_owned().await {
-                        Ok(p) => p,
+                    let hash_str = hex::encode(hash);
+                    info!("Chunk(`{hash_str}`) -> `{peer}` upload is initiated: length: `{:.1}` MiB",
+                        data.len() as f32 / 1_048_576f32
+                    );
+                    // keep the chunk's status at inflight to simulate backoff in case of timeout or failure
+                    let upload_result = timeout(
+                        Duration::from_secs(CHUNK_UPLOAD_WINDOW),
+                        blob_transfer::push(control, peer, hash_str.clone(), data, tx_events)
+                    ).await;
+                    drop(permit);
+                    match upload_result {
+                        Ok(Ok(_)) => {
+                            info!("Chunk(`{hash_str}`) -> `{peer}` upload finished successfully in `{:.1} secs`.",
+                                upload_onset.elapsed().as_secs_f32()
+                            );
+                            let _ = tx_internal.send(InternalMessage::UpdateChunkStatus {
+                                hash,
+                                status: ChunkUploadStatus::Finalized { owner: peer },
+                                at: Instant::now(),
+                            });
+                        }
+                        Ok(Err(e)) => {
+                            warn!("Chunk(`{hash_str}`) -> `{peer}` upload failed after `{:.1} secs:`: {e:?}",
+                                upload_onset.elapsed().as_secs_f32(),
+                            );
+                            let _ = tx_internal.send(InternalMessage::UpdateChunkStatus {
+                                hash,
+                                status: ChunkUploadStatus::Pending,
+                                at: Instant::now(),
+                            });
+                        }
                         Err(e) => {
-                            warn!("Could not get upload allowance: {e:?}");
-                            return
+                            warn!("Chunk(`{hash_str}`) -> `{peer}` upload has timed out.");
                         }
                     };
-                    let hash_str = hex::encode(hash);
-                    // upload initiates
-                    if let Err(e) = blob_transfer::push(
-                        control,
-                        peer,
-                        hash_str.clone(),
-                        data,
-                        tx_events
-                    ).await {
-                        warn!(
-                            "Push blob(`{}`) to Peer(`{}`) failed: {}",
-                            hash_str,
-                            peer,
-                            e
-                        );
-                        // keep it at inflight to simulate backoff
-                        return
-                    }
-                    // upload succeeded
-                    info!(
-                        "Blob(`{}`) has been successfully transferred to Peer(`{}`).",
-                        hash_str,
-                        peer
-                    );
-                    if let Err(e) = tx_internal.send(InternalMessage::UpdateChunkStatus {
-                        hash,
-                        status: ChunkUploadStatus::Finalized { owner: peer },
-                        at: Instant::now(),
-                    }) {
-                        warn!(
-                            "Could not notify the coordinator about an completed upload for chunk(`{}`): {:?}",
-                            hash_str,
-                            e
-                        );
-                    }
                 });
             }
         }
