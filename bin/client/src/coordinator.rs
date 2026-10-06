@@ -353,7 +353,7 @@ impl Pipeline {
                     );
                     let upload_result = timeout(
                         Duration::from_secs(CHUNK_UPLOAD_WINDOW),
-                        blob_transfer::push(control, peer, hash_str.clone(), data, tx_events)
+                        blob_transfer::push(control, peer, hash, data, tx_events)
                     ).await;
                     drop(permit);
                     match upload_result {

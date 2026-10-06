@@ -67,6 +67,7 @@ pub async fn process_swarm(
             tokio::select! {
                 _ = shutdown.cancelled() => {
                     warn!("Received shutdown request.");
+                    break
                 },
                 // try to discover new peers
                 _i = timer_peer_discovery.select_next_some() => {                
@@ -156,26 +157,16 @@ pub async fn process_swarm(
                     }
                     // <gossipsub>
                     SwarmEvent::Behaviour(GlobalBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                        propagation_source: peer_id,
                         message,
                         ..
                     })) => {
+                        let Some(peer_id) = message.source else { continue };
                         match bincode::deserialize::<u8>(&message.data) {
                             Ok(_) => {
-                                if let Err(e) = tx_handler.send(HandlerMessage::WouldStore {
-                                    peer_id: peer_id,
-                                }).await {
-                                    warn!(
-                                        "Gossip notify error: `{:?}`",
-                                        e
-                                    );                                    
-                                }
+                                let _ = tx_handler.send(HandlerMessage::WouldStore { peer_id }).await;
                             }
                             Err(e) => {
-                                warn!(
-                                    "Gossip message decode error: `{:?}`",
-                                    e
-                                );
+                                warn!("Gossip message decode error: `{e:?}`");
                             }
                         }
                     }

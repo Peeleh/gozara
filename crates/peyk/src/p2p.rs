@@ -36,17 +36,9 @@ use crate::protocol;
 fn prepare_gossipsub_behaviour(
     keypair: &identity::Keypair,
 )-> Result<gossipsub::Behaviour> {
-    // content-address messages
-    let message_id_fn = |message: &gossipsub::Message| {
-        let mut s = DefaultHasher::new();
-        message.data.hash(&mut s);
-        gossipsub::MessageId::from(s.finish().to_string())
-    };
-    // set a custom Gossipsub configuration
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(10)) // aid debugging by not cluttering log space
         .validation_mode(gossipsub::ValidationMode::Strict) // enforce message signing
-        .message_id_fn(message_id_fn) 
         .build()?;
     Ok(
         gossipsub::Behaviour::new(
