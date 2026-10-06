@@ -7,10 +7,11 @@ use libp2p_stream::{Control, IncomingStreams};
 use tokio::sync::{mpsc, oneshot};
 use bytes::Bytes;
 
+pub type Hash = [u8; 32];
+
 pub const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/gozara/blob-push/1.0.0");
 pub const PULL_PROTOCOL: StreamProtocol = StreamProtocol::new("/gozara/blob-pull/1.0.0");
 
-/// Generous ceiling on the hash frame 
 const HASH_MAX_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +23,7 @@ pub enum Direction {
 #[derive(Debug, Clone)]
 pub struct TransferEvent {
     pub peer: PeerId,
-    pub hash: String,
+    pub hash: Hash,
     pub len: usize,
     pub direction: Direction,
     pub ok: bool,
@@ -32,9 +33,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     io: &mut W,
     bytes: &[u8]
 ) -> Result<()> {
-    let len: u32 = bytes
-        .len()
-        .try_into()?;
+    let len: u32 = bytes.len().try_into()?;
     io.write_all(&len.to_be_bytes()).await?;
     io.write_all(bytes).await?;
     Ok(())
@@ -48,25 +47,17 @@ async fn read_frame<R: AsyncRead + Unpin>(
     io.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > max_len {
-        return Err(eyre!(format!(
-            "frame of {} bytes exceeds {}-byte limit",
-            len, max_len
-        )))
+        return Err(eyre!(format!("frame of `{len}` bytes exceeds `{max_len}`-byte limit")))
     }
     let mut buf = vec![0u8; len];
     io.read_exact(&mut buf).await?;
     Ok(buf)
 }
 
-fn hash_from_bytes(bytes: Vec<u8>) -> Result<String> {
-    String::from_utf8(bytes)
-        .map_err(|_| eyre!("hash was not valid utf-8"))
-}
-
 pub async fn push(
     mut control: Control,
     peer: PeerId,
-    hash: String,
+    hash: Hash,
     data: Bytes,
     events_tx: mpsc::UnboundedSender<TransferEvent>,
 ) -> Result<()> {
@@ -75,8 +66,8 @@ pub async fn push(
         .await
         .map_err(|e| eyre!(format!("Open stream error: {}", e.to_string())))?;
 
-    write_frame(&mut stream, hash.as_bytes()).await?;
-    write_frame(&mut stream, data.as_ref()).await?;
+    write_frame(&mut stream, &hash).await?;
+    write_frame(&mut stream, &data).await?;
 
     let mut ack_tag = [0u8; 1];
     stream.read_exact(&mut ack_tag).await?;
@@ -88,16 +79,12 @@ pub async fn push(
         Err(eyre!(String::from_utf8_lossy(&reason).into_owned()))
     };
     if let Err(e) = stream.close().await {
-        warn!("Peer closed the push stream unexpectedly: {:?}", e);
+        warn!(%peer, error = %e, "Peer closed the push stream unexpectedly.");
     }
 
     let len = data.len();
     let _ = events_tx.send(TransferEvent {
-        peer,
-        hash,
-        len,
-        direction: Direction::Push,
-        ok: result.is_ok(),
+        peer, hash, len, direction: Direction::Push, ok: result.is_ok()
     });
     result
 }
@@ -107,7 +94,7 @@ pub async fn push(
 pub async fn pull(
     mut control: Control,
     peer: PeerId,
-    hash: String,
+    hash: Hash,
     max_payload_len: usize,
     events_tx: mpsc::UnboundedSender<TransferEvent>,
 ) -> Result<Option<Vec<u8>>> {
@@ -116,7 +103,7 @@ pub async fn pull(
         .await
         .map_err(|e| eyre!(format!("Open stream error: {}", e.to_string())))?;
 
-    write_frame(&mut stream, hash.as_bytes()).await?;
+    write_frame(&mut stream, &hash).await?;
 
     let mut found_tag = [0u8; 1];
     stream.read_exact(&mut found_tag).await?;
@@ -124,18 +111,18 @@ pub async fn pull(
         Ok(None)
     } else {
         let data = read_frame(&mut stream, max_payload_len).await?;
-        let received_hash = blake3::hash(&data).to_hex().to_string();
+        let received_hash = blake3::hash(&data);
         if  received_hash == hash {
             Ok(Some(data))
         } else {
             Err(eyre!(format!(
                 "Pull hash mismatch, expected `{}` but got `{}`",
-                hash, received_hash
+                hex::encode(hash.as_slice()), hex::encode(received_hash.as_slice())
             )))
         }
     };
     if let Err(e) = stream.close().await {
-        warn!("Peer closed the pull stream unexpectedly: {:?}", e);
+        warn!(%peer, error = %e, "Peer closed the pull stream unexpectedly.");
     }
 
     let len = match &result {
@@ -155,14 +142,14 @@ pub async fn pull(
 #[derive(Debug)]
 pub struct IncomingPush {
     pub peer: PeerId,
-    pub hash: String,
+    pub hash: Hash,
     pub data: Vec<u8>,
 }
 
 #[derive(Debug)]
 pub struct IncomingPull {
     pub peer: PeerId,
-    pub hash: String,
+    pub hash: Hash,
     reply_tx: oneshot::Sender<Option<Vec<u8>>>,
 }
 
@@ -196,10 +183,12 @@ async fn handle_incoming_push(
     max_payload_len: usize,
     tx: mpsc::UnboundedSender<IncomingPush>,
 ) -> Result<()> {
-    let expected_hash = hash_from_bytes(read_frame(&mut stream, HASH_MAX_LEN).await?)?;
+    let expected_hash: Hash = read_frame(&mut stream, HASH_MAX_LEN).await?
+        .try_into()
+        .map_err(|e| eyre!(format!("Hash conversion error: {e:?}")))?;
     let data = read_frame(&mut stream, max_payload_len).await?;
 
-    let actual_hash = blake3::hash(&data).to_hex().to_string();
+    let actual_hash = blake3::hash(&data);
     if actual_hash != expected_hash {
         stream.write_all(&[0u8]).await?;
         write_frame(
@@ -210,7 +199,7 @@ async fn handle_incoming_push(
         let _ = stream.close().await;
         return Err(eyre!(format!(
             "Hash mismatch for incoming push, expected `{}` got `{}`.",
-            expected_hash, actual_hash
+            hex::encode(expected_hash), hex::encode(actual_hash.as_slice())
         )))
     }
 
@@ -220,7 +209,7 @@ async fn handle_incoming_push(
     }
     let _ = tx.send(IncomingPush {
         peer,
-        hash: actual_hash,
+        hash: expected_hash,
         data
     });
     Ok(())
@@ -248,13 +237,11 @@ async fn handle_incoming_pull(
     peer: PeerId,
     tx: mpsc::UnboundedSender<IncomingPull>,
 ) -> Result<()> {
-    let hash = hash_from_bytes(read_frame(&mut stream, HASH_MAX_LEN).await?)?;
+    let hash: Hash = read_frame(&mut stream, HASH_MAX_LEN).await?
+        .try_into()
+        .map_err(|e| eyre!(format!("Hash conversion error: {e:?}")))?;
     let (reply_tx, reply_rx) = oneshot::channel();
-    let _ = tx.send(IncomingPull {
-        peer,
-        hash: hash.clone(),
-        reply_tx,
-    });
+    let _ = tx.send(IncomingPull { peer, hash, reply_tx });
     // If the caller drops the IncomingGet without responding, treat it
     // the same as "don't have it" rather than hanging the requester.
     let data = reply_rx.await.unwrap_or(None);

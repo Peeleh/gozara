@@ -28,8 +28,8 @@ const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 // blob lifetime: 4 hours
 const BLOB_LIFETIME: u64 = 4 * 60 * 60;
 
-// max incoming(network) blob size 8 MiB
-const MAX_BLOB_SIZE: usize = 8 * 1024 * 1024;
+// max incoming(network) blob size 4 MiB
+const MAX_NETWORK_BLOB_SIZE: usize = 4 * 1024 * 1024;
 // 30 seconds
 const CHUNK_UPLOAD_WINDOW: u64 = 30;
 // provider hints are valid for 5 minutes
@@ -399,7 +399,7 @@ pub async fn run(
     //  setup blob transfer
     let mut incoming_pushes = blob_transfer::accept_pushes(
         blob_transfer_control.accept(blob_transfer::PUSH_PROTOCOL)?,
-        MAX_BLOB_SIZE
+        MAX_NETWORK_BLOB_SIZE
     );
     let mut incoming_pulls = blob_transfer::accept_pulls(
         blob_transfer_control.accept(blob_transfer::PULL_PROTOCOL)?

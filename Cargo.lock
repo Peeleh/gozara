@@ -2700,6 +2700,7 @@ dependencies = [
  "bytes",
  "eyre",
  "futures",
+ "hex",
  "libp2p",
  "libp2p-quic",
  "libp2p-stream",
