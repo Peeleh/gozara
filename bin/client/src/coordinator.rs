@@ -351,7 +351,6 @@ impl Pipeline {
                     info!("Chunk(`{hash_str}`) -> `{peer}` upload is initiated: length: `{:.1}` MiB",
                         data.len() as f32 / 1_048_576f32
                     );
-                    // keep the chunk's status at inflight to simulate backoff in case of timeout or failure
                     let upload_result = timeout(
                         Duration::from_secs(CHUNK_UPLOAD_WINDOW),
                         blob_transfer::push(control, peer, hash_str.clone(), data, tx_events)
@@ -369,7 +368,7 @@ impl Pipeline {
                             });
                         }
                         Ok(Err(e)) => {
-                            warn!("Chunk(`{hash_str}`) -> `{peer}` upload failed after `{:.1} secs:`: {e:?}",
+                            warn!("Chunk(`{hash_str}`) -> `{peer}` upload failed after `{:.1} secs`: {e:?}",
                                 upload_onset.elapsed().as_secs_f32(),
                             );
                             let _ = tx_internal.send(InternalMessage::UpdateChunkStatus {
@@ -377,8 +376,9 @@ impl Pipeline {
                                 status: ChunkUploadStatus::Pending,
                                 at: Instant::now(),
                             });
+                            // mark the stalled peer as faulty and do not match again
                         }
-                        Err(e) => {
+                        Err(_) => {
                             warn!("Chunk(`{hash_str}`) -> `{peer}` upload has timed out.");
                         }
                     };
