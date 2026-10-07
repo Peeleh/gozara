@@ -1,6 +1,6 @@
 // Claude generated code
 use eyre::{eyre, Result};
-use tracing::{warn};
+use tracing::{warn, debug};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use libp2p::{PeerId, StreamProtocol};
 use libp2p_stream::{Control, IncomingStreams};
@@ -79,7 +79,7 @@ pub async fn push(
         Err(eyre!(String::from_utf8_lossy(&reason).into_owned()))
     };
     if let Err(e) = stream.close().await {
-        warn!(%peer, error = %e, "Peer closed the push stream unexpectedly.");
+        debug!(%peer, error = %e, "Peer closed a completed push stream unexpectedly.");
     }
 
     let len = data.len();
@@ -122,7 +122,7 @@ pub async fn pull(
         }
     };
     if let Err(e) = stream.close().await {
-        warn!(%peer, error = %e, "Peer closed the pull stream unexpectedly.");
+        warn!(%peer, error = %e, "Peer closed a completed pull stream unexpectedly.");
     }
 
     let len = match &result {

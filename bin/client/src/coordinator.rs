@@ -463,9 +463,8 @@ pub async fn run(
                                         let now = Instant::now();
                                         pipeline.storage_permits.insert(
                                             peer_id,
-                                            now.checked_add(
-                                                Duration::from_secs(valid_for as u64)
-                                            ).unwrap_or_else(|| now)
+                                            now.checked_add(Duration::from_secs(valid_for))
+                                            .unwrap_or_else(|| now)
                                         );
                                         // todo: storage permit is already invalid in case of overflow
                                         pipeline.assign_chunks().await;

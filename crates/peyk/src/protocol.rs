@@ -14,7 +14,7 @@ pub enum Request {
 pub enum Response {
     // convention: each ACK is worth ~20 chunks(up to 100mb) of storage space
      IssuedStoragePermit {
-        valid_for: u8
+        valid_for: u64
     },
     BlobMeta {
         id: String,
