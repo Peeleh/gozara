@@ -11,16 +11,15 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use bytes::Bytes;
+use blake3::Hash;
 use libp2p::PeerId;
 use rs_merkle::MerkleTree;
 use crate::bridge::{
     Message as BridgeMessage,
     Status as BridgeStatus
 };
-use crate::blake3_wrapper::Blake3Hash;
+use crate::blake3_wrapper::Blake3;
 use peyk::{blob_transfer, HandlerMessage, SwarmMessage};
-
-pub type Hash = [u8; 32];
 
 // 4 MB
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
@@ -83,7 +82,7 @@ enum Blob {
         root_hash: Hash,
         data: Bytes,
         chunks: HashMap<Hash, Chunk>,
-        merkle_tree: MerkleTree::<Blake3Hash>,
+        merkle_tree: MerkleTree::<Blake3>,
         created_at: Instant,
     },
     RemoteBlob {
@@ -177,7 +176,7 @@ impl Pipeline {
             let chunks: Vec<(Hash, Chunk)> = cloned_data
                 .chunks(CHUNK_SIZE)
                 .map(|c| (
-                    blake3::hash(c).into(),
+                    blake3::hash(c),
                     Chunk {
                         data: cloned_data.slice_ref(c),
                         status: TimestampedStatus {
@@ -188,9 +187,9 @@ impl Pipeline {
                 )).collect();            
             let chunk_hashes = chunks
                 .iter()
-                .map(|(hash, _)| *hash)
-                .collect::<Vec<Hash>>();
-            let merkle_tree = MerkleTree::<Blake3Hash>::from_leaves(&chunk_hashes);
+                .map(|(hash, _)| *hash.as_bytes())
+                .collect::<Vec<[u8; 32]>>();
+            let merkle_tree = MerkleTree::<Blake3>::from_leaves(chunk_hashes.as_slice());
 
             (chunks, merkle_tree)
         }).await?;
@@ -204,7 +203,7 @@ impl Pipeline {
         self.pending_blobs.push_back(
             Blob::LocalBlob {
                 id,
-                root_hash,
+                root_hash: root_hash.into(),
                 data,
                 chunks: chunks.into_iter().collect(),
                 merkle_tree,
@@ -317,7 +316,7 @@ impl Pipeline {
         for hash in chosen_chunks.into_iter() {
             let peer = peers[peer_index];
             let Ok(permit) = self.upload_allowance.clone().try_acquire_owned() else {
-                warn!(%peer, hash = %hex::encode(hash), "Could not get an upload permit for transfer.");
+                warn!(%peer, hash = %hash.to_hex().as_str(), "Could not get an upload permit for transfer.");
                 break
             };
             assignments.entry(peer).or_default().push((
@@ -340,7 +339,7 @@ impl Pipeline {
                 // self send for maintenance and state propagation
                 let tx_internal = self.tx_internal.clone();
                 tokio::spawn(async move {
-                    let hash_str = hex::encode(hash);
+                    let hash_str = hash.to_hex().to_string();
                     info!(chunk = %hash_str, %peer, length = data.len() as f32 / 1_048_576f32, "upload is initiated");
                     let upload_result = timeout(
                         Duration::from_secs(CHUNK_UPLOAD_WINDOW),
@@ -529,7 +528,7 @@ pub async fn run(
                             status,
                             ..
                         } => {
-                            let hash_str = hex::encode(hash);
+                            let hash_str = hash.to_hex().to_string();
                             info!("A new chunk(`{}`) status update(`{:?}`)", hash_str, status);
                             let Some(blob) = &mut pipeline.current_blob else {
                                 warn!("The current blob is invalid.");

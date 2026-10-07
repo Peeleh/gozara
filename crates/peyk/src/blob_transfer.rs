@@ -6,8 +6,7 @@ use libp2p::{PeerId, StreamProtocol};
 use libp2p_stream::{Control, IncomingStreams};
 use tokio::sync::{mpsc, oneshot};
 use bytes::Bytes;
-
-pub type Hash = [u8; 32];
+use blake3::Hash;
 
 pub const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/gozara/blob-push/1.0.0");
 pub const PULL_PROTOCOL: StreamProtocol = StreamProtocol::new("/gozara/blob-pull/1.0.0");
@@ -66,7 +65,7 @@ pub async fn push(
         .await
         .map_err(|e| eyre!(format!("Open stream error: {}", e.to_string())))?;
 
-    write_frame(&mut stream, &hash).await?;
+    write_frame(&mut stream, hash.as_slice()).await?;
     write_frame(&mut stream, &data).await?;
 
     let mut ack_tag = [0u8; 1];
@@ -103,7 +102,7 @@ pub async fn pull(
         .await
         .map_err(|e| eyre!(format!("Open stream error: {}", e.to_string())))?;
 
-    write_frame(&mut stream, &hash).await?;
+    write_frame(&mut stream, hash.as_slice()).await?;
 
     let mut found_tag = [0u8; 1];
     stream.read_exact(&mut found_tag).await?;
@@ -183,8 +182,7 @@ async fn handle_incoming_push(
     max_payload_len: usize,
     tx: mpsc::UnboundedSender<IncomingPush>,
 ) -> Result<()> {
-    let expected_hash: Hash = read_frame(&mut stream, HASH_MAX_LEN).await?
-        .try_into()
+    let expected_hash = Hash::from_slice(&read_frame(&mut stream, HASH_MAX_LEN).await?)
         .map_err(|e| eyre!(format!("Hash conversion error: {e:?}")))?;
     let data = read_frame(&mut stream, max_payload_len).await?;
 
@@ -199,7 +197,7 @@ async fn handle_incoming_push(
         let _ = stream.close().await;
         return Err(eyre!(format!(
             "Hash mismatch for incoming push, expected `{}` got `{}`.",
-            hex::encode(expected_hash), hex::encode(actual_hash.as_slice())
+            expected_hash.to_hex().as_str(), actual_hash.to_hex().as_str()
         )))
     }
 
@@ -237,8 +235,7 @@ async fn handle_incoming_pull(
     peer: PeerId,
     tx: mpsc::UnboundedSender<IncomingPull>,
 ) -> Result<()> {
-    let hash: Hash = read_frame(&mut stream, HASH_MAX_LEN).await?
-        .try_into()
+    let hash = Hash::from_slice(&read_frame(&mut stream, HASH_MAX_LEN).await?)
         .map_err(|e| eyre!(format!("Hash conversion error: {e:?}")))?;
     let (reply_tx, reply_rx) = oneshot::channel();
     let _ = tx.send(IncomingPull { peer, hash, reply_tx });

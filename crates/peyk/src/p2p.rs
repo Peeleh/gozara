@@ -1,11 +1,4 @@
-use std::{
-    time::Duration,
-    hash::{
-        Hash,
-        Hasher
-    },
-    collections::hash_map::DefaultHasher
-};
+use std::time::Duration;
 use libp2p::{
     core::{        
         muxing::StreamMuxerBox,
