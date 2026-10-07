@@ -5,7 +5,7 @@ pub mod blob_transfer;
 use std::time::Duration;
 use futures::stream::StreamExt;
 use eyre::Result;
-use tracing::{info, warn};
+use tracing::{warn, debug};
 use libp2p::{
     identify,  
     gossipsub,
@@ -72,7 +72,7 @@ pub async fn process_swarm(
                 // try to discover new peers
                 _i = timer_peer_discovery.select_next_some() => {                
                     let random_peer_id = PeerId::random();
-                    // info!("Searching for the closest peers to `{random_peer_id}`");
+                    debug!("Searching for the closest peers to `{random_peer_id}`");
                     swarm
                         .behaviour_mut()
                         .kademlia
@@ -107,14 +107,14 @@ pub async fn process_swarm(
                 // libp2p events
                 event = swarm.select_next_some() => match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
-                        info!("Local node is listening on {address}");
+                        debug!("Local node is listening on {address}");
                     }
                     SwarmEvent::ConnectionEstablished {
                         peer_id,
                         endpoint,
                         ..
                     } => {
-                        info!(
+                        debug!(
                             "A connection has been established to {} via {:?}",
                             peer_id,
                             endpoint
@@ -122,15 +122,11 @@ pub async fn process_swarm(
                     }
                     // <identify>
                     SwarmEvent::Behaviour(GlobalBehaviourEvent::Identify(identify::Event::Received {
-                        // peer_id,
-                        // info,
+                        peer_id,
+                        info,
                         ..
                     })) => {
-                        // info!(
-                        //     "Received identify from {}: {:#?}`",
-                        //     peer_id,
-                        //     info
-                        // );                        
+                        debug!("Received identify from `{peer_id}`: {info:#?}`");
                     }
                     SwarmEvent::NewExternalAddrOfPeer {
                         peer_id,
@@ -146,10 +142,7 @@ pub async fn process_swarm(
                             )
                             .all(|a| !a.is_private() && !a.is_loopback());
                         if is_public {                        
-                            info!(
-                                "Added public address of the peer to the DHT: {}",
-                                address
-                            );
+                            debug!("Added public address of the peer to the DHT: {}", address);
                             swarm.behaviour_mut()
                                 .kademlia
                                 .add_address(&peer_id, address);
@@ -163,19 +156,19 @@ pub async fn process_swarm(
                         let Some(peer_id) = message.source else { continue };
                         match bincode::deserialize::<u8>(&message.data) {
                             Ok(_) => {
-                                let _ = tx_handler.send(HandlerMessage::WouldStore { peer_id }).await;
+                                let _ = tx_handler.try_send(HandlerMessage::WouldStore { peer_id });
                             }
                             Err(e) => {
-                                warn!("Gossip message decode error: `{e:?}`");
+                                debug!("Gossip message decode error: `{e:?}`");
                             }
                         }
                     }
                     // <kademlia>
                     SwarmEvent::Behaviour(GlobalBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
-                        result: kad::QueryResult::GetClosestPeers(Ok(_ok)),
+                        result: kad::QueryResult::GetClosestPeers(Ok(ok)),
                         ..
                     })) => {
-                        // info!("Query finished with closest peers: {:#?}", ok.peers);
+                        debug!("Query for the closest peers is finished: {:?}", ok.peers);
                     }
                     SwarmEvent::Behaviour(GlobalBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
                         result:
@@ -184,7 +177,7 @@ pub async fn process_swarm(
                             })),
                         ..
                     })) => {
-                        // warn!("Query for closest peers timed out");
+                        debug!("Query for the closest peers timed out.");
                     }
                     // SwarmEvent::Behaviour(GlobalBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
                     //     result: kad::QueryResult::GetProviders(
@@ -213,17 +206,12 @@ pub async fn process_swarm(
                         },
                         ..
                     })) => {
-                        if let Err(e) = tx_handler.send(HandlerMessage::Request {
+                        let _ = tx_handler.try_send(HandlerMessage::Request {
                             peer_id: peer_id,
                             request_id: request_id,
                             request: request,
                             channel: channel
-                        }).await {
-                            warn!(
-                                "Request relay error: `{:?}`",
-                                e
-                            );                                    
-                        }
+                        });
                     }
                     SwarmEvent::Behaviour(GlobalBehaviourEvent::ReqResp(request_response::Event::Message {
                         peer: peer_id,
@@ -234,21 +222,14 @@ pub async fn process_swarm(
                         },
                         ..
                     })) => {                
-                        if let Err(e) = tx_handler.send(HandlerMessage::Response {
+                        let _ = tx_handler.send(HandlerMessage::Response {
                             peer_id: peer_id,
                             request_id: request_id,
                             response: response
-                        }).await {
-                            warn!(
-                                "Response relay error: `{:?}`",
-                                e
-                            );                                    
-                        }
-                    }
-                    // <blob transfer>
-                    
+                        });
+                    },
                     _ => {
-                        // info!("{:#?}", event);
+                        debug!("{:#?}", event);
                     }
                 },
             }
