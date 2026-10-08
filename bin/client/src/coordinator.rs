@@ -80,7 +80,6 @@ enum Blob {
     LocalBlob {
         id: String,
         root_hash: Hash,
-        data: Bytes,
         chunks: HashMap<Hash, Chunk>,
         merkle_tree: MerkleTree::<Blake3>,
         created_at: Instant,
@@ -204,7 +203,6 @@ impl Pipeline {
             Blob::LocalBlob {
                 id,
                 root_hash: root_hash.into(),
-                data,
                 chunks: chunks.into_iter().collect(),
                 merkle_tree,
                 created_at: Instant::now()
