@@ -16,13 +16,11 @@ use libp2p::PeerId;
 use rs_merkle::MerkleTree;
 use crate::bridge::{
     Message as BridgeMessage,
-    Status as BridgeStatus
+    Status as BridgeStatus,
+    AdmittedBlob
 };
 use crate::blake3_wrapper::Blake3;
 use peyk::{blob_transfer, HandlerMessage, SwarmMessage};
-
-// 4 MB
-const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 // blob lifetime: 4 hours
 const BLOB_LIFETIME: u64 = 4 * 60 * 60;
@@ -41,10 +39,7 @@ pub enum Message {
         id: String,
     },
     // src: the bridge
-    NewBlob {
-        id: String,
-        data: Bytes,
-    }
+    NewBlob(AdmittedBlob)
 }
 
 enum InternalMessage {
@@ -80,8 +75,9 @@ enum Blob {
     LocalBlob {
         id: String,
         root_hash: Hash,
-        chunks: HashMap<Hash, Chunk>,
         merkle_tree: MerkleTree::<Blake3>,
+        chunks: HashMap<Hash, Chunk>,
+        _permit: OwnedSemaphorePermit,
         created_at: Instant,
     },
     RemoteBlob {
@@ -141,75 +137,30 @@ impl Pipeline {
         }
     }
 
-    async fn add_local_blob(
+    fn add_local_blob(
         &mut self,
-        id: String,
-        data: Bytes,
-    ) -> Result<()> {
-        if data.is_empty() {
-            return Err(eyre!("Empty blob."))
-        }
-        // todo: also check with the archived blobs
-        if self.pending_blobs
-            .iter()
-            .any(|blob| match blob {
-                Blob::LocalBlob { id: ex_id, .. } => *ex_id == id,
-                Blob::RemoteBlob { id: ex_id, .. } => *ex_id == id,
-            })
-        {
-            return Err(eyre!("Duplicate blob: {}", id))
-        }
-        let is_duplicate = match self.current_blob.as_ref() {
-            Some(blob) => match blob {
-                Blob::LocalBlob { id: ex_id, .. } => *ex_id == id,
-                Blob::RemoteBlob { id: ex_id, .. } => *ex_id == id,
-            }
-            None => false
-        };
-        if is_duplicate {
-            return Err(eyre!("Duplicate blob: {}", id))
-        }
-
-        let cloned_data = data.clone();
-        let (chunks, merkle_tree) = task::spawn_blocking(move || {
-            let chunks: Vec<(Hash, Chunk)> = cloned_data
-                .chunks(CHUNK_SIZE)
-                .map(|c| (
-                    blake3::hash(c),
-                    Chunk {
-                        data: cloned_data.slice_ref(c),
-                        status: TimestampedStatus {
-                            at: Instant::now(),
-                            status: ChunkUploadStatus::Pending,
-                        }
-                    }
-                )).collect();            
-            let chunk_hashes = chunks
-                .iter()
-                .map(|(hash, _)| *hash.as_bytes())
-                .collect::<Vec<[u8; 32]>>();
-            let merkle_tree = MerkleTree::<Blake3>::from_leaves(chunk_hashes.as_slice());
-
-            (chunks, merkle_tree)
-        }).await?;
-        let root_hash = merkle_tree
-            .root()
-            .ok_or_else(|| eyre!("Couldn't get the merkle root."))?;
-        info!(
-            "Blob(`{}`) is chunked and Merklized with root hash(`{}`). We'll now try to distribute it.",
-            id, hex::encode(root_hash)
-        );
+        admitted_blob: AdmittedBlob
+    ) {
+        let chunks_map: HashMap<Hash, Chunk> = admitted_blob.chunks
+            .into_iter()
+            .map(|(hash, data)| (hash, Chunk {
+                data,
+                status: TimestampedStatus {
+                    status: ChunkUploadStatus::Pending,
+                    at: Instant::now()
+                }
+            }))
+            .collect();
         self.pending_blobs.push_back(
             Blob::LocalBlob {
-                id,
-                root_hash: root_hash.into(),
-                chunks: chunks.into_iter().collect(),
-                merkle_tree,
+                id: admitted_blob.id,
+                root_hash: admitted_blob.root_hash,
+                merkle_tree: admitted_blob.merkle_tree,
+                chunks: chunks_map,
+                _permit: admitted_blob._permit,
                 created_at: Instant::now()
             }
         );
-        // todo: write data to disk?
-        Ok(())
     }
 
     fn archive_cur_blob(&mut self) -> Result<()> {
@@ -359,7 +310,7 @@ impl Pipeline {
                         }
                         Ok(Err(e)) => {
                             info!(chunk = %hash_str, %peer,
-                                dur = upload_onset.elapsed().as_secs_f32(),
+                                error = %e, dur = upload_onset.elapsed().as_secs_f32(),
                                 "upload failed."
                             );
                             let _ = tx_internal.send(InternalMessage::UpdateChunkStatus {
@@ -497,21 +448,9 @@ pub async fn run(
                             }
                         }
                         // local blob: chunk and distribute
-                        Message::NewBlob { id, data } => {
-                            match pipeline.add_local_blob(id.clone(), data).await {
-                                Ok(_) => {
-                                    pipeline.begin_next_blob().await;
-                                }
-                                Err(add_err) => {
-                                    warn!("Add local blob error: {:?}", add_err);
-                                    let _ = tx_bridge.send(BridgeMessage::UpdateStatus {
-                                        id,
-                                        status: BridgeStatus::Failed { reason: Some(add_err.to_string()) }
-                                    }).await;
-                                    // todo: retry
-                                    continue
-                                }
-                            }
+                        Message::NewBlob(blob) => {
+                            pipeline.add_local_blob(blob);
+                            pipeline.begin_next_blob().await;
                         }
                     }
                     None => {
