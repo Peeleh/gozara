@@ -181,7 +181,7 @@ pub async fn run(
             .with_graceful_shutdown(shutdown_bridge.cancelled_owned())
             .await
         {
-            warn!("Failed to start HTTP bridge server: {:?}", e);
+            warn!("Failed to start the HTTP bridge server: {e:?}");
         }
     });
     let shutdown_msg = shutdown.clone();

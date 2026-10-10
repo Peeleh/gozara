@@ -208,6 +208,7 @@ impl Pipeline {
                 created_at: Instant::now()
             }
         );
+        // todo: write data to disk?
         Ok(())
     }
 
