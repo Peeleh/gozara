@@ -2,10 +2,10 @@ use std::{
     collections::{VecDeque, HashMap},
     sync::Arc,
 };
-use eyre::{eyre, Result};
-use tracing::{info, warn, trace};
+use eyre::{Result};
+use tracing::{info, warn, debug};
 use tokio::{
-    sync::{mpsc, oneshot, Semaphore, OwnedSemaphorePermit},
+    sync::{mpsc, Semaphore, OwnedSemaphorePermit},
     time::{Instant, Duration, timeout, interval},
     task,
 };
@@ -21,9 +21,6 @@ use crate::bridge::{
 };
 use crate::blake3_wrapper::Blake3;
 use peyk::{blob_transfer, HandlerMessage, SwarmMessage};
-
-// blob lifetime: 4 hours
-const BLOB_LIFETIME: u64 = 4 * 60 * 60;
 
 // max incoming(network) blob size 4 MiB
 const MAX_NETWORK_BLOB_SIZE: usize = 4 * 1024 * 1024;
@@ -77,7 +74,7 @@ enum Blob {
         root_hash: Hash,
         merkle_tree: MerkleTree::<Blake3>,
         chunks: HashMap<Hash, Chunk>,
-        _permit: OwnedSemaphorePermit,
+        allowance: OwnedSemaphorePermit,
         created_at: Instant,
     },
     RemoteBlob {
@@ -87,14 +84,6 @@ enum Blob {
         chunks: HashMap<Hash, Bytes>,
     }
 }
-
-impl Blob {
-    async fn archive(&self) -> Result<()> {
-        // todo
-        Ok(())
-    }
-}
-
 
 struct Pipeline {
     pending_blobs: VecDeque<Blob>,
@@ -108,7 +97,7 @@ struct Pipeline {
 
     tx_swarm: mpsc::Sender<SwarmMessage>,
 
-    blob_transfer_control: libp2p_stream::Control,
+    blob_transfer_control: peyk::Control,
     tx_blob_transfer_events: mpsc::UnboundedSender<blob_transfer::TransferEvent>,
 
     // to gate i/o usage
@@ -120,7 +109,7 @@ impl Pipeline {
     pub fn new(
         tx_internal: mpsc::UnboundedSender<InternalMessage>,
         tx_swarm: mpsc::Sender<SwarmMessage>,
-        blob_transfer_control: libp2p_stream::Control,
+        blob_transfer_control: peyk::Control,
         tx_blob_transfer_events: mpsc::UnboundedSender<blob_transfer::TransferEvent>
     ) -> Self {
         Pipeline {
@@ -157,7 +146,7 @@ impl Pipeline {
                 root_hash: admitted_blob.root_hash,
                 merkle_tree: admitted_blob.merkle_tree,
                 chunks: chunks_map,
-                _permit: admitted_blob._permit,
+                allowance: admitted_blob.allowance,
                 created_at: Instant::now()
             }
         );
@@ -167,22 +156,6 @@ impl Pipeline {
         let _blob = self.current_blob.take().unwrap();
         // todo: archive the blob
         Ok(())
-    }
-
-    // periodic cleanup
-    fn remove_stale_blobs(
-        &mut self
-    ) {
-        // let now = Instant::now();
-        // self.blobs.retain(|_, blob| {
-        //     match blob {
-        //         Blob::LocalBlob { created_at, .. } => {
-        //             now.duration_since(*created_at).as_secs() < BLOB_LIFETIME
-        //         }
-        //         Blob::RemoteBlob { .. } => true
-        //     }
-        // });
-        // todo: inform the bridge?
     }
 
     pub async fn request_storage_permits(&mut self) {
@@ -220,15 +193,15 @@ impl Pipeline {
     pub async fn assign_chunks(&mut self) {
         let num_available_permits = self.upload_allowance.available_permits();
         if num_available_permits == 0 {
-            trace!("No upload allowance for now, cannot proceed with chunk assignment.");
+            debug!("No upload allowance for now, cannot proceed with chunk assignment.");
             return
         }
         let Some(blob) = &mut self.current_blob else {
-            trace!("The current blob is invalid so chunk assignment won't proceed.");
+            debug!("The current blob is invalid so chunk assignment won't proceed.");
             return
         };
         let Blob::LocalBlob { chunks, .. } = blob else {
-            trace!("Chunk assignment does not apply here as the current blob is of `remote` kind.");
+            debug!("Chunk assignment does not apply here as the current blob is of `remote` kind.");
             return
         };
         let now = Instant::now();
@@ -290,7 +263,7 @@ impl Pipeline {
                 let tx_internal = self.tx_internal.clone();
                 tokio::spawn(async move {
                     let hash_str = hash.to_hex().to_string();
-                    info!(chunk = %hash_str, %peer, length = data.len() as f32 / 1_048_576f32, "upload is initiated");
+                    info!(chunk = %hash_str, %peer, length = data.len() as f32 / 1_048_576f32, "upload is initiated.");
                     let upload_result = timeout(
                         Duration::from_secs(CHUNK_UPLOAD_WINDOW),
                         blob_transfer::push(control, peer, hash, data, tx_events)
@@ -298,7 +271,7 @@ impl Pipeline {
                     drop(permit);
                     match upload_result {
                         Ok(Ok(_)) => {
-                            info!(chunk = %hash_str, %peer,
+                            debug!(chunk = %hash_str, %peer,
                                 dur = upload_onset.elapsed().as_secs_f32(),
                                 "upload finished successfully."
                             );
@@ -309,7 +282,7 @@ impl Pipeline {
                             });
                         }
                         Ok(Err(e)) => {
-                            info!(chunk = %hash_str, %peer,
+                            debug!(chunk = %hash_str, %peer,
                                 error = %e, dur = upload_onset.elapsed().as_secs_f32(),
                                 "upload failed."
                             );
@@ -321,7 +294,7 @@ impl Pipeline {
                             // mark the stalled peer as faulty and do not match again
                         }
                         Err(_) => {
-                            info!(chunk = %hash_str, %peer,
+                            debug!(chunk = %hash_str, %peer,
                                 dur = upload_onset.elapsed().as_secs_f32(),
                                 "upload has timed out."
                             );
@@ -377,7 +350,6 @@ pub async fn run(
                     if pipeline.current_blob.is_some() {
                         pipeline.request_storage_permits().await;
                     }
-                    // pipeline.remove_stale_blobs();
                 },
 
                 _i = timer_assign.tick() => {
@@ -469,11 +441,11 @@ pub async fn run(
                             let hash_str = hash.to_hex().to_string();
                             info!("A new chunk(`{}`) status update(`{:?}`)", hash_str, status);
                             let Some(blob) = &mut pipeline.current_blob else {
-                                warn!("The current blob is invalid.");
+                                warn!("No current blob.");
                                 continue
                             };
                             let Blob::LocalBlob { id, chunks, .. } = blob else {
-                                trace!("The current blob is of `remote` kind.");
+                                debug!("The current blob is of `remote` kind.");
                                 continue
                             };
                             let Some(chunk) = chunks.get_mut(&hash) else {
@@ -550,6 +522,7 @@ pub async fn run(
     Ok(jh)
 }
 
+#[allow(unused)]
 async fn dump_blob_to_disk(
     id: &str,
     data: Bytes

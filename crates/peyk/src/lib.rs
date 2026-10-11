@@ -25,6 +25,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tokio_stream::wrappers::IntervalStream;
+pub use libp2p_stream::Control;
 use p2p::{GlobalBehaviour, GlobalBehaviourEvent};
 
 pub enum SwarmMessage {

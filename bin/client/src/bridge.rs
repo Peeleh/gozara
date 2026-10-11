@@ -4,7 +4,7 @@ use std::{
 };
 use futures::StreamExt;
 use eyre::Result;
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 use serde::Serialize;
 use tokio::{
     task::{JoinHandle, spawn_blocking},
@@ -13,7 +13,6 @@ use tokio::{
 };
 use tokio_util::{
     sync::CancellationToken,
-    io::ReaderStream
 };
 use rs_merkle::MerkleTree;
 use blake3::Hash;
@@ -26,11 +25,6 @@ use axum::{
     Router,
     response::{Json, Response, IntoResponse}
 };
-use tower::{
-    ServiceExt,
-    limit::ConcurrencyLimitLayer
-};
-use tower_http::services::ServeFile;
 use dashmap::{
     DashMap,
     mapref::entry::Entry
@@ -39,12 +33,14 @@ use crate::blake3_wrapper::Blake3;
 use crate::coordinator::Message as CoordMessage;
 
 // 1 GiB
-const MAX_BLOB_SIZE: usize = 1 * 1024 * 1024 * 1024;
+const MAX_BLOB_SIZE: usize = 1 << 30;
 
-// 4 MB
+// 4 MiB
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
-// each permit = 4 Mib, in total we want 6 Gib worth of blob upload permits aka memory pressure
+const ONE_MIB: f32 = 1_048_576.0;
+
+// each permit = 4 MiB, in total we want 6 GiB worth of blob upload permits aka memory pressure
 const TOTAL_CHUNK_BUDGET: usize = 1536;
 
 // deadline to finish each chunk streaming
@@ -69,8 +65,8 @@ struct Admission {
 }
 
 impl Admission {
-    fn new(state: &BridgeState, id: &str) -> Result<Self, StatusCode> {
-        match state.status_map.entry(id.to_string()) {
+    fn new(state: &BridgeState, id: String) -> Result<Self, StatusCode> {
+        match state.status_map.entry(id.clone()) {
             Entry::Occupied(_) => Err(StatusCode::CONFLICT),
             Entry::Vacant(e) => {
                 e.insert(vec![TimestampedStatus {
@@ -79,7 +75,7 @@ impl Admission {
                 }]);
                 Ok(Self {
                     map: state.status_map.clone(),
-                    id: id.to_string(),
+                    id,
                     committed: false
                 })
             }
@@ -91,7 +87,7 @@ impl Admission {
     }
 }
 
-// remove the blob from the map if uploads is cancelled mid-journey
+// remove the blob from the map if the upload is cancelled mid-journey
 impl Drop for Admission {
     fn drop(&mut self) {
         if !self.committed {
@@ -100,7 +96,7 @@ impl Drop for Admission {
     }
 }
 
-// Error type for the new_blob: status code + 'Retry-after: 5s' on 503
+// Error type for the new_blob: status code + 'Retry-After: 5s' on 503
 struct Reject(StatusCode);
 
 impl From<StatusCode> for Reject {
@@ -152,12 +148,12 @@ pub struct AdmittedBlob {
     pub root_hash: Hash,
     pub merkle_tree: MerkleTree<Blake3>,
     pub chunks: Vec<(Hash, Bytes)>,
-    pub _permit: OwnedSemaphorePermit,
+    pub allowance: OwnedSemaphorePermit,
 }
 
 #[derive(Clone)]
 pub struct BridgeState {
-    hashing_permit: Arc<Semaphore>,
+    hashing: Arc<Semaphore>,
     blob_budget: Arc<Semaphore>,
     status_map: Arc<DashMap<String, Vec<TimestampedStatus>>>,
     tx_coord: mpsc::Sender<CoordMessage>,
@@ -166,7 +162,7 @@ pub struct BridgeState {
 impl BridgeState {
     pub fn new(tx_coord: mpsc::Sender<CoordMessage>) -> Self {
         BridgeState {
-            hashing_permit: Arc::new(Semaphore::new(2)),
+            hashing: Arc::new(Semaphore::new(2)),
             blob_budget: Arc::new(Semaphore::new(TOTAL_CHUNK_BUDGET)),
             status_map: Arc::new(DashMap::new()),
             tx_coord
@@ -190,7 +186,6 @@ async fn get_status(
 async fn get_blob(
     State(state): State<BridgeState>,
     Path(id): Path<String>,
-    req: axum::extract::Request
 ) -> impl IntoResponse {
     let status = state.status_map
         .get(&id)
@@ -198,10 +193,6 @@ async fn get_blob(
         .unwrap_or(Status::Missing);
     match status {
         Status::Finalized  => {
-            // ServeFile::new(path)
-            //     .oneshot(req)
-            //     .await
-            //     .into_response()
             StatusCode::ACCEPTED.into_response()
         }
         Status::Missing => {
@@ -231,14 +222,16 @@ async fn new_blob(
         .and_then(|v| v.to_str().ok()?.parse().ok())
         .ok_or(StatusCode::LENGTH_REQUIRED)?;
     if declared_blob_len == 0 {
+        debug!("Ignored an empty blob.");
         return Err(StatusCode::BAD_REQUEST.into())
     }
     let num_chunks = declared_blob_len.div_ceil(CHUNK_SIZE);
     if declared_blob_len > MAX_BLOB_SIZE || num_chunks > TOTAL_CHUNK_BUDGET {
+        debug!("Ignored a blob which is too large: `{:.1}` MiB", declared_blob_len as f32 / ONE_MIB);
         return Err(StatusCode::PAYLOAD_TOO_LARGE.into())
     }
-    let admission = Admission::new(&state, &id)?;
-    let permit = state.blob_budget.clone()
+    let admission = Admission::new(&state, id.clone())?;
+    let allowance = state.blob_budget.clone()
         .try_acquire_many_owned(num_chunks as u32)
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     // stream in chunks
@@ -260,7 +253,7 @@ async fn new_blob(
             buf.extend_from_slice(&data.split_to(take));
             if buf.len() == CHUNK_SIZE {
                 let full = std::mem::replace(&mut buf, BytesMut::with_capacity(CHUNK_SIZE)).freeze();
-                chunks.push(hash_chunk(state.hashing_permit.clone(), full).await?);
+                chunks.push(hash_chunk(state.hashing.clone(), full).await?);
             }
         }
     }
@@ -268,19 +261,24 @@ async fn new_blob(
         return Err(StatusCode::BAD_REQUEST.into())
     }
     if !buf.is_empty() {
-        chunks.push(hash_chunk(state.hashing_permit.clone(), buf.freeze()).await?);
+        chunks.push(hash_chunk(state.hashing.clone(), buf.freeze()).await?);
     }
     // merklize it
     let leaves: Vec<[u8; 32]> = chunks.iter().map(|(h, _)| *h.as_bytes()).collect();
     let merkle_tree = MerkleTree::<Blake3>::from_leaves(leaves.as_slice());
-    let root_hash = merkle_tree.root().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-
+    let root_hash: Hash = merkle_tree.root()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
+        .into();
+    let root_hash_str = root_hash.to_hex().to_string();
+    info!("Admitted a new blob with id(`{id}`), root hash(`{root_hash_str}`), #chunks(`{num_chunks}`), and total size of `{:.1}` Mib",
+        declared_blob_len as f32 / ONE_MIB
+    );
     state.tx_coord
-        .send(CoordMessage::NewBlob(AdmittedBlob { id, root_hash: root_hash.into(), merkle_tree, chunks, _permit: permit }))
+        .send(CoordMessage::NewBlob(AdmittedBlob { id, root_hash, merkle_tree, chunks, allowance }))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     admission.commit();
-    Ok((StatusCode::CREATED, hex::encode(root_hash)))
+    Ok((StatusCode::CREATED, root_hash.to_hex().to_string()))
 }
 
 pub async fn run(
@@ -324,10 +322,9 @@ pub async fn run(
                             } => {
                                 match state.status_map.entry(id.clone()) {
                                     Entry::Occupied(mut entry) => {
-                                        entry.get_mut().push(TimestampedStatus {
-                                            at: Instant::now(),
-                                            status: status
-                                        });
+                                        entry.get_mut().push(
+                                            TimestampedStatus { at: Instant::now(), status }
+                                        );
                                     }
                                     Entry::Vacant(_) => {
                                         warn!(
