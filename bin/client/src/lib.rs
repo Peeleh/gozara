@@ -1,3 +1,4 @@
+mod admission;
 mod bridge;
 mod blake3_wrapper;
 mod coordinator;
@@ -27,9 +28,7 @@ pub struct Config {
     pub zone: String,
 }
 
-async fn go_public(
-    config: Config
-) -> Result<Swarm<peyk::p2p::GlobalBehaviour>> {
+fn go_public(config: Config) -> Result<Swarm<peyk::p2p::GlobalBehaviour>> {
     // derive peer id
     let local_key = {
         if let Some(key_file) = config.key_file {
@@ -123,16 +122,16 @@ pub async fn run(
     config: Config,
     shutdown: CancellationToken
 ) -> Result<()> {
-    let swarm = go_public(config).await?;
+    let swarm = go_public(config)?;
     let blob_transfer_control = swarm.behaviour().blob_stream.new_control();
     let (tx_swarm, rx_swarm) = mpsc::channel::<peyk::SwarmMessage>(16);
     let (tx_handler, rx_handler) = mpsc::channel::<peyk::HandlerMessage>(256);
-    let (tx_coord, rx_coord) = mpsc::channel::<coordinator::Message>(4);
-    let (tx_bridge, rx_bridge) = mpsc::channel::<bridge::Message>(128);
+    let (tx_admission, rx_admission) = mpsc::channel::<admission::ToPipeline>(16);
+    let (tx_bridge, rx_bridge) = mpsc::channel::<admission::ToBridge>(128);
     let (mut swarm_jh, mut coord_jh, mut bridge_jh) = tokio::try_join!(
         peyk::process_swarm(swarm, rx_swarm, tx_handler, shutdown.clone()),
-        coordinator::run(rx_coord, rx_handler, tx_swarm, tx_bridge, blob_transfer_control, shutdown.clone()),
-        bridge::run(rx_bridge, tx_coord, shutdown.clone())
+        coordinator::run(rx_admission, rx_handler, tx_swarm, tx_bridge, blob_transfer_control, shutdown.clone()),
+        bridge::run(rx_bridge, tx_admission, shutdown.clone())
     )?;
     tokio::select! {
         r = &mut swarm_jh => {

@@ -5,14 +5,15 @@ use std::{
 use futures::StreamExt;
 use eyre::Result;
 use tracing::{info, warn, debug};
-use serde::Serialize;
 use tokio::{
-    task::{JoinHandle, spawn_blocking},
-    sync::{mpsc, Semaphore, OwnedSemaphorePermit},
-    time::timeout
+    sync::{mpsc, Semaphore},
+    time::timeout,
+    task,
 };
-use tokio_util::{
-    sync::CancellationToken,
+use tokio_util::sync::CancellationToken;
+use dashmap::{
+    DashMap,
+    mapref::entry::Entry
 };
 use rs_merkle::MerkleTree;
 use blake3::Hash;
@@ -25,150 +26,28 @@ use axum::{
     Router,
     response::{Json, Response, IntoResponse}
 };
-use dashmap::{
-    DashMap,
-    mapref::entry::Entry
-};
 use crate::blake3_wrapper::Blake3;
-use crate::coordinator::Message as CoordMessage;
+use crate::admission::{Status, ToPipeline, ToBridge, AdmittedBlob, CHUNK_SIZE};
 
 // 1 GiB
 const MAX_BLOB_SIZE: usize = 1 << 30;
 
-// 4 MiB
-pub const CHUNK_SIZE: usize = 4 * 1024 * 1024;
-
-// for display purposes
-const ONE_MIB: f32 = 1_048_576.0;
-
 // each permit = 4 MiB, in total we want 6 GiB worth of blob upload permits aka memory pressure
 const TOTAL_CHUNK_BUDGET: usize = 1536;
 
-// deadline to finish each chunk streaming
+// max silence between frames
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-
-#[derive(Clone, Serialize, Debug)]
-#[serde(tag = "status", rename_all = "lowercase")]
-pub enum Status {
-    // outbound blobs
-    Pending,
-    // inbound blobs
-    Missing,
-    Finalized,
-    Failed { reason: Option<String> },
+#[derive(Clone, Debug)]
+pub struct TimestampedStatus {
+    pub at: Instant,
+    pub status: Status,
 }
 
 struct Admission {
     map: Arc<DashMap<String, Vec<TimestampedStatus>>>,
     id: String,
     committed: bool
-}
-
-impl Admission {
-    fn new(state: &BridgeState, id: String) -> Result<Self, StatusCode> {
-        match state.status_map.entry(id.clone()) {
-            Entry::Occupied(_) => Err(StatusCode::CONFLICT),
-            Entry::Vacant(e) => {
-                e.insert(vec![TimestampedStatus {
-                    at: Instant::now(),
-                    status: Status::Pending
-                }]);
-                Ok(Self {
-                    map: state.status_map.clone(),
-                    id,
-                    committed: false
-                })
-            }
-        }
-    }
-
-    fn commit(mut self) {
-        self.committed = true
-    }
-}
-
-// remove the blob from the map if the upload is cancelled mid-journey
-impl Drop for Admission {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.map.remove(&self.id);
-        }
-    }
-}
-
-// Error type for the new_blob: status code + 'Retry-After: 5s' on 503
-struct Reject(StatusCode);
-
-impl From<StatusCode> for Reject {
-    fn from(code: StatusCode) -> Self { Reject(code) }
-}
-
-impl IntoResponse for Reject {
-    fn into_response(self) -> Response {
-        match self.0 {
-            StatusCode::SERVICE_UNAVAILABLE => {
-                (self.0, [(header::RETRY_AFTER, "5")]).into_response()
-            },
-            code => code.into_response()
-        }
-    }
-}
-
-async fn hash_chunk(
-    hashing: Arc<Semaphore>,
-    chunk: Bytes
-) -> Result<(Hash, Bytes), StatusCode> {
-    let permit = hashing.acquire_owned().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let c = chunk.clone();
-    let hash = spawn_blocking(move || {
-        let h = blake3::hash(&c);
-        drop(permit);
-        h
-    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok((hash, chunk))
-}
-
-
-#[derive(Clone, Debug)]
-struct TimestampedStatus {
-    at: Instant,
-    status: Status,
-}
-
-pub enum Message {
-    UpdateStatus {
-        id: String,
-        status: Status
-    }
-}
-
-pub struct AdmittedBlob {
-    pub id: String,
-    pub root_hash: Hash,
-    pub merkle_tree: MerkleTree<Blake3>,
-    pub chunks: Vec<(Hash, Bytes)>,
-    pub allowance: OwnedSemaphorePermit,
-}
-
-#[derive(Clone)]
-pub struct BridgeState {
-    hashing: Arc<Semaphore>,
-    blob_budget: Arc<Semaphore>,
-    status_map: Arc<DashMap<String, Vec<TimestampedStatus>>>,
-    tx_coord: mpsc::Sender<CoordMessage>,
-}
-
-impl BridgeState {
-    pub fn new(tx_coord: mpsc::Sender<CoordMessage>) -> Self {
-        BridgeState {
-            hashing: Arc::new(Semaphore::new(2)),
-            blob_budget: Arc::new(Semaphore::new(TOTAL_CHUNK_BUDGET)),
-            status_map: Arc::new(DashMap::new()),
-            tx_coord
-        }
-    }
 }
 
 async fn get_status(
@@ -197,7 +76,7 @@ async fn get_blob(
             StatusCode::ACCEPTED.into_response()
         }
         Status::Missing => {
-            if let Err(e) = state.tx_coord.send(CoordMessage::GetBlob {
+            if let Err(e) = state.tx_admission.send(ToPipeline::GetBlob {
                 id: id.clone(),
             }).await {
                 warn!("Failed to send the get blob message to the blob store: {e:?}");
@@ -223,16 +102,14 @@ async fn new_blob(
         .and_then(|v| v.to_str().ok()?.parse().ok())
         .ok_or(StatusCode::LENGTH_REQUIRED)?;
     if declared_blob_len == 0 {
-        debug!("Ignored an empty blob.");
         return Err(StatusCode::BAD_REQUEST.into())
     }
     let num_chunks = declared_blob_len.div_ceil(CHUNK_SIZE);
     if declared_blob_len > MAX_BLOB_SIZE || num_chunks > TOTAL_CHUNK_BUDGET {
-        debug!("Ignored a blob which is too large: `{:.1}` MiB", declared_blob_len as f32 / ONE_MIB);
         return Err(StatusCode::PAYLOAD_TOO_LARGE.into())
     }
     let admission = Admission::new(&state, id.clone())?;
-    let allowance = state.blob_budget.clone()
+    let allowance = state.admission_budget.clone()
         .try_acquire_many_owned(num_chunks as u32)
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     // stream in chunks
@@ -271,28 +148,115 @@ async fn new_blob(
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
         .into();
     let root_hash_str = root_hash.to_hex().to_string();
-    info!("Admitted a new blob with id(`{id}`), root hash(`{root_hash_str}`), #chunks(`{num_chunks}`), and total size of `{:.1}` Mib",
-        declared_blob_len as f32 / ONE_MIB
-    );
-    state.tx_coord
-        .send(CoordMessage::NewBlob(AdmittedBlob { id, root_hash, merkle_tree, chunks, allowance }))
+    state.tx_admission
+        .send(ToPipeline::NewBlob(AdmittedBlob { id: id.clone(), root_hash, merkle_tree, chunks, allowance }))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     admission.commit();
-    Ok((StatusCode::CREATED, root_hash.to_hex().to_string()))
+    info!("Admitted a new blob with id(`{id}`), root hash(`{root_hash_str}`), #chunks(`{num_chunks}`), and total size of `{:.1}` MiB",
+        declared_blob_len as f32 / 1_048_576f32
+    );
+    Ok((StatusCode::CREATED, root_hash_str))
+}
+
+impl Admission {
+    pub fn new(state: &BridgeState, id: String) -> Result<Self, StatusCode> {
+        match state.status_map.entry(id.clone()) {
+            Entry::Occupied(_) => Err(StatusCode::CONFLICT),
+            Entry::Vacant(e) => {
+                e.insert(vec![TimestampedStatus {
+                    at: Instant::now(),
+                    status: Status::Pending
+                }]);
+                Ok(Self {
+                    map: state.status_map.clone(),
+                    id,
+                    committed: false
+                })
+            }
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true
+    }
+}
+
+// remove the blob from the map if the upload is cancelled mid-journey
+impl Drop for Admission {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.map.remove(&self.id);
+        }
+    }
+}
+
+// Error type for the new_blob: status code + 'Retry-After: 5' on 503
+struct Reject(StatusCode);
+
+impl From<StatusCode> for Reject {
+    fn from(code: StatusCode) -> Self { Reject(code) }
+}
+
+impl IntoResponse for Reject {
+    fn into_response(self) -> Response {
+        debug!("Blob rejected");
+        match self.0 {
+            StatusCode::SERVICE_UNAVAILABLE => {
+                (self.0, [(header::RETRY_AFTER, "5")]).into_response()
+            },
+            code => code.into_response()
+        }
+    }
+}
+
+async fn hash_chunk(
+    hashing: Arc<Semaphore>,
+    chunk: Bytes
+) -> Result<(Hash, Bytes), StatusCode> {
+    let permit = hashing.acquire_owned().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let c = chunk.clone();
+    let hash = task::spawn_blocking(move || {
+        let h = blake3::hash(&c);
+        drop(permit);
+        h
+    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok((hash, chunk))
+}
+
+
+#[derive(Clone)]
+struct BridgeState {
+    hashing: Arc<Semaphore>,
+    admission_budget: Arc<Semaphore>,
+    status_map: Arc<DashMap<String, Vec<TimestampedStatus>>>,
+    tx_admission: mpsc::Sender<ToPipeline>,
+}
+
+impl BridgeState {
+    pub fn new(tx_admission: mpsc::Sender<ToPipeline>) -> Self {
+        BridgeState {
+            hashing: Arc::new(Semaphore::new(2)),
+            admission_budget: Arc::new(Semaphore::new(TOTAL_CHUNK_BUDGET)),
+            status_map: Arc::new(DashMap::new()),
+            tx_admission
+        }
+    }
 }
 
 pub async fn run(
-    mut rx_bridge: mpsc::Receiver<Message>,
-    tx_coord: mpsc::Sender<CoordMessage>,
+    mut rx_bridge: mpsc::Receiver<ToBridge>,
+    tx_admission: mpsc::Sender<ToPipeline>,
     shutdown: CancellationToken
-) -> Result<JoinHandle<()>> {
-    let state = BridgeState::new(tx_coord);
+) -> Result<tokio::task::JoinHandle<()>> {
+    let state = BridgeState::new(tx_admission);
     let state_server = state.clone();
     let shutdown_bridge = shutdown.clone();
     let app = Router::new()
         .route("/status/{id}", get(get_status))
         .route("/blob/{id}", post(new_blob))
+        // .route("/getblob/{id}", get(get_blob))
         .with_state(state_server);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8709").await?;
@@ -302,7 +266,7 @@ pub async fn run(
             .with_graceful_shutdown(shutdown_bridge.cancelled_owned())
             .await
         {
-            warn!("Failed to start the HTTP bridge server: {e:?}");
+            warn!("Failed to serve the HTTP bridge: {e:?}");
         }
     });
     let shutdown_msg = shutdown.clone();
@@ -310,14 +274,14 @@ pub async fn run(
         loop {
             tokio::select! {
                 _ = shutdown_msg.cancelled() => {
-                    warn!("Received shutdown request.");
+                    info!("Received shutdown request.");
                     break
                 },
 
                 m = rx_bridge.recv() => match m {
                     Some(b_msg) => {
                         match b_msg {
-                            Message::UpdateStatus {
+                            ToBridge::UpdateStatus {
                                 id,
                                 status
                             } => {

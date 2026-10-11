@@ -5,7 +5,7 @@ pub mod blob_transfer;
 use std::time::Duration;
 use futures::stream::StreamExt;
 use eyre::Result;
-use tracing::{warn, debug};
+use tracing::{info, warn, debug};
 use libp2p::{
     identify,  
     gossipsub,
@@ -67,7 +67,7 @@ pub async fn process_swarm(
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    warn!("Received shutdown request.");
+                    info!("Received shutdown request.");
                     break
                 },
                 // try to discover new peers

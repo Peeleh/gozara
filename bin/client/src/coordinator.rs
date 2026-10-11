@@ -2,23 +2,20 @@ use std::{
     collections::{VecDeque, HashMap},
     sync::Arc,
 };
-use eyre::{Result};
+use eyre::Result;
 use tracing::{info, warn, debug};
 use tokio::{
     sync::{mpsc, Semaphore, OwnedSemaphorePermit},
     time::{Instant, Duration, timeout, interval},
-    task,
 };
 use tokio_util::sync::CancellationToken;
 use bytes::Bytes;
 use blake3::Hash;
 use libp2p::PeerId;
 use rs_merkle::MerkleTree;
-use crate::bridge::{
-    Message as BridgeMessage,
+use crate::admission::{
     Status as BridgeStatus,
-    AdmittedBlob,
-    CHUNK_SIZE
+    ToPipeline, ToBridge, AdmittedBlob, CHUNK_SIZE
 };
 use crate::blake3_wrapper::Blake3;
 use peyk::{blob_transfer, HandlerMessage, SwarmMessage};
@@ -27,16 +24,6 @@ use peyk::{blob_transfer, HandlerMessage, SwarmMessage};
 const CHUNK_UPLOAD_WINDOW: u64 = 30;
 // provider hints are valid for 5 minutes
 const STORAGE_PROVIDER_DECAY: u64 = 5 * 60;
-
-pub enum Message {
-    // src: the bridge
-    // to gather blob from remote nodes
-    GetBlob {
-        id: String,
-    },
-    // src: the bridge
-    NewBlob(AdmittedBlob)
-}
 
 enum InternalMessage {
     UpdateChunkStatus {
@@ -48,7 +35,7 @@ enum InternalMessage {
 
 #[derive(Debug, Clone)]
 enum ChunkUploadStatus {
-    Pending,
+        Pending,
     Inflight {
         to: PeerId,
     },
@@ -125,7 +112,7 @@ impl Pipeline {
         }
     }
 
-    fn add_local_blob(
+    pub fn add_local_blob(
         &mut self,
         admitted_blob: AdmittedBlob
     ) {
@@ -151,7 +138,7 @@ impl Pipeline {
         );
     }
 
-    fn archive_cur_blob(&mut self) -> Result<()> {
+    pub fn archive_cur_blob(&mut self) -> Result<()> {
         let _blob = self.current_blob.take().unwrap();
         // todo: archive the blob
         Ok(())
@@ -251,7 +238,7 @@ impl Pipeline {
                 status: ChunkUploadStatus::Inflight { to: peer },
                 at: now
             };
-            // todo: spawn here
+            // todo: spawn here instead
             peer_index = (peer_index + 1) % num_peers;
         }
         // upload chunks
@@ -263,12 +250,13 @@ impl Pipeline {
                 let tx_internal = self.tx_internal.clone();
                 tokio::spawn(async move {
                     let hash_str = hash.to_hex().to_string();
-                    debug!(chunk = %hash_str, %peer, length = data.len() as f32 / 1_048_576f32, "upload is initiated.");
+                    debug!(chunk = %hash_str, %peer, size = data.len() as f32 / 1_048_576f32, "upload is initiated.");
                     let upload_result = timeout(
                         Duration::from_secs(CHUNK_UPLOAD_WINDOW),
                         blob_transfer::push(control, peer, hash, data, tx_events)
                     ).await;
                     drop(permit);
+                    // mark the stalled peer as faulty and do not match again
                     match upload_result {
                         Ok(Ok(_)) => {
                             debug!(chunk = %hash_str, %peer,
@@ -282,7 +270,7 @@ impl Pipeline {
                             });
                         }
                         Ok(Err(e)) => {
-                            debug!(chunk = %hash_str, %peer,
+                            warn!(chunk = %hash_str, %peer,
                                 error = %e, dur = upload_onset.elapsed().as_secs_f32(),
                                 "upload failed."
                             );
@@ -291,10 +279,9 @@ impl Pipeline {
                                 status: ChunkUploadStatus::Pending,
                                 at: Instant::now(),
                             });
-                            // mark the stalled peer as faulty and do not match again
                         }
                         Err(_) => {
-                            debug!(chunk = %hash_str, %peer,
+                            warn!(chunk = %hash_str, %peer,
                                 dur = upload_onset.elapsed().as_secs_f32(),
                                 "upload has timed out."
                             );
@@ -307,13 +294,13 @@ impl Pipeline {
 }
 
 pub async fn run(
-    mut rx_coord: mpsc::Receiver<Message>,
+    mut rx_admission: mpsc::Receiver<ToPipeline>,
     mut rx_handler: mpsc::Receiver<HandlerMessage>,
     tx_swarm: mpsc::Sender<SwarmMessage>,
-    tx_bridge: mpsc::Sender<BridgeMessage>,
-    mut blob_transfer_control: libp2p_stream::Control,
+    tx_bridge: mpsc::Sender<ToBridge>,
+    mut blob_transfer_control: peyk::Control,
     shutdown: CancellationToken,
-) -> Result<task::JoinHandle<()>> {
+) -> Result<tokio::task::JoinHandle<()>> {
     //  setup blob transfer
     let mut incoming_pushes = blob_transfer::accept_pushes(
         blob_transfer_control.accept(blob_transfer::PUSH_PROTOCOL)?,
@@ -337,7 +324,7 @@ pub async fn run(
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    warn!("Received shutdown request.");
+                    info!("Received shutdown request.");
                     break
                 },
 
@@ -385,7 +372,7 @@ pub async fn run(
                                         pipeline.storage_permits.insert(
                                             peer_id,
                                             now.checked_add(Duration::from_secs(valid_for))
-                                            .unwrap_or_else(|| now)
+                                            .unwrap_or(now)
                                         );
                                         // todo: storage permit is already invalid in case of overflow
                                         pipeline.assign_chunks().await;
@@ -401,10 +388,10 @@ pub async fn run(
                     }
                 },
                 // messages
-                m = rx_coord.recv() => match m {
+                m = rx_admission.recv() => match m {
                     Some(msg) => match msg {
                         // remote blob: download chunks and assemble 
-                        Message::GetBlob { id } => {
+                        ToPipeline::GetBlob { id } => {
                             if let Some(Blob::LocalBlob { .. }) = pipeline.current_blob {
                                 // todo
                             } else {
@@ -420,7 +407,7 @@ pub async fn run(
                             }
                         }
                         // local blob: chunk and distribute
-                        Message::NewBlob(blob) => {
+                        ToPipeline::NewBlob(blob) => {
                             pipeline.add_local_blob(blob);
                             pipeline.begin_next_blob().await;
                         }
@@ -460,16 +447,16 @@ pub async fn run(
                             match status {
                                 ChunkUploadStatus::Pending => {},
                                 ChunkUploadStatus::Inflight { to } => {
-                                    info!("Chunk is being sent to Peer(`{}`).", to);
+                                    debug!("Chunk is being sent to Peer(`{}`).", to);
                                 },
                                 ChunkUploadStatus::Finalized { owner } => {
-                                    info!("Chunk has been successfully uploaded to peer(`{}`).", owner);
+                                    debug!("Chunk has been successfully uploaded to peer(`{}`).", owner);
                                     let is_finalized = chunks
                                         .values()
                                         .all(|chunk| matches!(chunk.status.status, ChunkUploadStatus::Finalized { .. }));
                                     if is_finalized {
-                                        info!("Blob(`{}`) is now stored globally.", id);
-                                        if let Err(e) = tx_bridge.send(BridgeMessage::UpdateStatus {
+                                        debug!("Blob(`{}`) is now stored globally.", id);
+                                        if let Err(e) = tx_bridge.send(ToBridge::UpdateStatus {
                                             id: id.to_string(),
                                             status: BridgeStatus::Finalized
                                         }).await {
@@ -479,8 +466,8 @@ pub async fn run(
                                         pipeline.begin_next_blob().await;
                                     }
                                     pipeline.assign_chunks().await;
-                                    // todo: when to notify it about failure?
                                 }
+                                // todo: when to notify it about failure?
                             };
 
                         }
