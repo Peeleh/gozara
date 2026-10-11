@@ -17,13 +17,12 @@ use rs_merkle::MerkleTree;
 use crate::bridge::{
     Message as BridgeMessage,
     Status as BridgeStatus,
-    AdmittedBlob
+    AdmittedBlob,
+    CHUNK_SIZE
 };
 use crate::blake3_wrapper::Blake3;
 use peyk::{blob_transfer, HandlerMessage, SwarmMessage};
 
-// max incoming(network) blob size 4 MiB
-const MAX_NETWORK_BLOB_SIZE: usize = 4 * 1024 * 1024;
 // 30 seconds
 const CHUNK_UPLOAD_WINDOW: u64 = 30;
 // provider hints are valid for 5 minutes
@@ -252,6 +251,7 @@ impl Pipeline {
                 status: ChunkUploadStatus::Inflight { to: peer },
                 at: now
             };
+            // todo: spawn here
             peer_index = (peer_index + 1) % num_peers;
         }
         // upload chunks
@@ -263,7 +263,7 @@ impl Pipeline {
                 let tx_internal = self.tx_internal.clone();
                 tokio::spawn(async move {
                     let hash_str = hash.to_hex().to_string();
-                    info!(chunk = %hash_str, %peer, length = data.len() as f32 / 1_048_576f32, "upload is initiated.");
+                    debug!(chunk = %hash_str, %peer, length = data.len() as f32 / 1_048_576f32, "upload is initiated.");
                     let upload_result = timeout(
                         Duration::from_secs(CHUNK_UPLOAD_WINDOW),
                         blob_transfer::push(control, peer, hash, data, tx_events)
@@ -317,7 +317,7 @@ pub async fn run(
     //  setup blob transfer
     let mut incoming_pushes = blob_transfer::accept_pushes(
         blob_transfer_control.accept(blob_transfer::PUSH_PROTOCOL)?,
-        MAX_NETWORK_BLOB_SIZE
+        CHUNK_SIZE
     );
     let mut incoming_pulls = blob_transfer::accept_pulls(
         blob_transfer_control.accept(blob_transfer::PULL_PROTOCOL)?
@@ -469,10 +469,12 @@ pub async fn run(
                                         .all(|chunk| matches!(chunk.status.status, ChunkUploadStatus::Finalized { .. }));
                                     if is_finalized {
                                         info!("Blob(`{}`) is now stored globally.", id);
-                                        let _ = tx_bridge.send(BridgeMessage::UpdateStatus {
+                                        if let Err(e) = tx_bridge.send(BridgeMessage::UpdateStatus {
                                             id: id.to_string(),
                                             status: BridgeStatus::Finalized
-                                        }).await;
+                                        }).await {
+                                            debug!("Failed to send the Finalized status to the bridge channel: {e:?}");
+                                        }
                                         let _ = pipeline.archive_cur_blob();
                                         pipeline.begin_next_blob().await;
                                     }

@@ -36,8 +36,9 @@ use crate::coordinator::Message as CoordMessage;
 const MAX_BLOB_SIZE: usize = 1 << 30;
 
 // 4 MiB
-const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+pub const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
+// for display purposes
 const ONE_MIB: f32 = 1_048_576.0;
 
 // each permit = 4 MiB, in total we want 6 GiB worth of blob upload permits aka memory pressure
