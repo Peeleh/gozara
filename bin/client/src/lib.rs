@@ -137,7 +137,10 @@ pub async fn run(
         r = &mut swarm_jh => {
             shutdown.cancel();
             match r {
-                Ok(_) => Err(eyre!("Swarm task exited unexpectedly.")),
+                Ok(_) => {
+                    info!("Swarm task exited.");
+                    Ok(())
+                },
                 Err(e) => Err(eyre!("Swarm task panicked: {e:?}"))
             }
         },
@@ -145,7 +148,10 @@ pub async fn run(
         r = &mut coord_jh => {
             shutdown.cancel();
             match r {
-                Ok(_) => Err(eyre!("Coordinator task exited unexpectedly.")),
+                Ok(_) => {
+                    info!("Coordinator task exited.");
+                    Ok(())
+                },
                 Err(e) => Err(eyre!("Coordinator task panicked: {e:?}"))
             }
         },
@@ -153,9 +159,12 @@ pub async fn run(
         r = &mut bridge_jh => {
             shutdown.cancel();
             match r {
-                Ok(_) => Err(eyre!("Bridge task exited unexpectedly.")),
-                Err(e) => Err(eyre!("Bride task panicked: {e:?}"))
+                Ok(_) => {
+                    info!("Bridge task exited.");
+                    Ok(())
+                },
+                Err(e) => Err(eyre!("Bridge task panicked: {e:?}"))
             }
-        },
+        }
     }
 }
