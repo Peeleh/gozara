@@ -176,7 +176,7 @@ impl Pipeline {
         }
     }
 
-    async fn assign_chunks(&mut self) {
+    fn assign_chunks(&mut self) {
         let num_available_permits = self.upload_allowance.available_permits();
         if num_available_permits == 0 {
             debug!("No upload allowance for now, cannot proceed with chunk assignment.");
@@ -190,105 +190,76 @@ impl Pipeline {
             debug!("Chunk assignment does not apply here as the current blob is of `remote` kind.");
             return
         };
-        let now = Instant::now();
+        let upload_onset = Instant::now();
         let peers: Vec<PeerId> = self.storage_permits
             .iter()
-            .filter_map(|(peer, expires_at)| if *expires_at > now { Some(peer) } else { None })
+            .filter_map(|(peer, expires_at)| if *expires_at > upload_onset { Some(peer) } else { None })
             .cloned()
             .collect();
         if peers.is_empty() {
             warn!("No eligible peers to assign.");
             return
         }
-        let chosen_chunks: Vec<Hash> = chunks
-            .iter()
-            .filter_map(|(hash, chunk)| {
-                match chunk.status.status {
-                    ChunkUploadStatus::Pending => Some(hash),
-                    ChunkUploadStatus::Inflight { .. }  => {
-                        // timed out
-                        if now.duration_since(chunk.status.at).as_secs() > CHUNK_UPLOAD_WINDOW {
-                            Some(hash)
-                        } else {
-                            None
-                        }
-                    },
-                    ChunkUploadStatus::Finalized { .. } => None
-                }
-            })
-            .take(num_available_permits)
-            .cloned()
-            .collect();
+        let eligible = |c: &Chunk| match c.status.status {
+            ChunkUploadStatus::Pending => true,
+            ChunkUploadStatus::Inflight { .. }  => upload_onset.duration_since(c.status.at).as_secs() > CHUNK_UPLOAD_WINDOW,
+            ChunkUploadStatus::Finalized { .. } => false
+        };
         let num_peers = peers.len();
-        let mut assignments = HashMap::<PeerId, Vec<(Hash, Bytes, OwnedSemaphorePermit, Instant)>>::new();
         let mut peer_index = 0;
-        for hash in chosen_chunks.into_iter() {
+        for (&hash, chunk) in chunks.iter_mut().filter(|(_, c)| eligible(c)).take(num_available_permits) {
             let peer = peers[peer_index];
             let Ok(permit) = self.upload_allowance.clone().try_acquire_owned() else {
-                warn!(%peer, hash = %hash.to_hex().as_str(), "Could not get an upload permit for transfer.");
+                warn!(%peer, hash = %hash.to_hex(), "Could not get an upload permit for transfer.");
                 break
             };
-            assignments.entry(peer).or_default().push((
-                hash,
-                chunks.get(&hash).unwrap().data.clone(),
-                permit,
-                now
-            ));
-            chunks.get_mut(&hash).unwrap().status = TimestampedStatus {
+            chunk.status = TimestampedStatus {
                 status: ChunkUploadStatus::Inflight { to: peer },
-                at: now
+                at: upload_onset
             };
-            // todo: spawn here instead
+            let control = self.blob_transfer_control.clone();
+            let tx_events = self.tx_blob_transfer_events.clone();
+            // self send for maintenance and state propagation
+            let tx_internal = self.tx_internal.clone();
+            let payload = chunk.data.clone();
+            tokio::spawn(async move {
+                let hash_str = hash.to_hex();
+                debug!(chunk = %hash_str, %peer, payload_mib = payload.len() as f32 / 1_048_576f32, "upload is initiated.");
+                let upload_result = timeout(
+                    Duration::from_secs(CHUNK_UPLOAD_WINDOW),
+                    blob_transfer::push(control, peer, hash, payload, tx_events)
+                ).await;
+                drop(permit);
+                // mark the stalled peer as faulty and do not match again
+                match upload_result {
+                    Ok(Ok(_)) => {
+                        debug!(chunk = %hash_str, %peer, dur = upload_onset.elapsed().as_secs_f32(), "upload finished successfully.");
+                        let _ = tx_internal.send(InternalMessage::UpdateChunkStatus {
+                            hash,
+                            status: ChunkUploadStatus::Finalized { owner: peer },
+                            at: Instant::now(),
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        warn!(chunk = %hash_str, %peer,
+                            error = %e, dur = upload_onset.elapsed().as_secs_f32(),
+                            "upload failed."
+                        );
+                        let _ = tx_internal.send(InternalMessage::UpdateChunkStatus {
+                            hash,
+                            status: ChunkUploadStatus::Pending,
+                            at: Instant::now(),
+                        });
+                    }
+                    Err(_) => {
+                        warn!(chunk = %hash_str, %peer,
+                            dur = upload_onset.elapsed().as_secs_f32(),
+                            "upload has timed out."
+                        );
+                    }
+                };
+            });
             peer_index = (peer_index + 1) % num_peers;
-        }
-        // upload chunks
-        for (peer, batch) in assignments.into_iter() {
-            for (hash, data, permit, upload_onset) in batch.into_iter() {
-                let control = self.blob_transfer_control.clone();
-                let tx_events = self.tx_blob_transfer_events.clone();
-                // self send for maintenance and state propagation
-                let tx_internal = self.tx_internal.clone();
-                tokio::spawn(async move {
-                    let hash_str = hash.to_hex().to_string();
-                    debug!(chunk = %hash_str, %peer, size = data.len() as f32 / 1_048_576f32, "upload is initiated.");
-                    let upload_result = timeout(
-                        Duration::from_secs(CHUNK_UPLOAD_WINDOW),
-                        blob_transfer::push(control, peer, hash, data, tx_events)
-                    ).await;
-                    drop(permit);
-                    // mark the stalled peer as faulty and do not match again
-                    match upload_result {
-                        Ok(Ok(_)) => {
-                            debug!(chunk = %hash_str, %peer,
-                                dur = upload_onset.elapsed().as_secs_f32(),
-                                "upload finished successfully."
-                            );
-                            let _ = tx_internal.send(InternalMessage::UpdateChunkStatus {
-                                hash,
-                                status: ChunkUploadStatus::Finalized { owner: peer },
-                                at: Instant::now(),
-                            });
-                        }
-                        Ok(Err(e)) => {
-                            warn!(chunk = %hash_str, %peer,
-                                error = %e, dur = upload_onset.elapsed().as_secs_f32(),
-                                "upload failed."
-                            );
-                            let _ = tx_internal.send(InternalMessage::UpdateChunkStatus {
-                                hash,
-                                status: ChunkUploadStatus::Pending,
-                                at: Instant::now(),
-                            });
-                        }
-                        Err(_) => {
-                            warn!(chunk = %hash_str, %peer,
-                                dur = upload_onset.elapsed().as_secs_f32(),
-                                "upload has timed out."
-                            );
-                        }
-                    };
-                });
-            }
         }
     }
 }
@@ -340,7 +311,7 @@ pub async fn run(
                 },
 
                 _i = timer_assign.tick() => {
-                    pipeline.assign_chunks().await;
+                    pipeline.assign_chunks();
                 },
                 // swarm handlers
                 hm = rx_handler.recv() => match hm {
@@ -375,7 +346,7 @@ pub async fn run(
                                             .unwrap_or(now)
                                         );
                                         // todo: storage permit is already invalid in case of overflow
-                                        pipeline.assign_chunks().await;
+                                        pipeline.assign_chunks();
                                     }
                                     peyk::protocol::Response::BlobMeta {..} => {}
                                 }
@@ -465,7 +436,7 @@ pub async fn run(
                                         let _ = pipeline.archive_cur_blob();
                                         pipeline.begin_next_blob().await;
                                     }
-                                    pipeline.assign_chunks().await;
+                                    pipeline.assign_chunks();
                                 }
                                 // todo: when to notify it about failure?
                             };
