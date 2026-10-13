@@ -26,6 +26,8 @@ use axum::{
     Router,
     response::{Json, Response, IntoResponse}
 };
+use mti::prelude::*;
+// use std::str::FromStr;
 use crate::blake3_wrapper::Blake3;
 use crate::admission::{Status, ToPipeline, ToBridge, AdmittedBlob, CHUNK_SIZE};
 
@@ -52,7 +54,13 @@ struct Admission {
 
 impl Admission {
     fn new(state: &BridgeState, id: String) -> Result<Self, StatusCode> {
-        match state.status_map.entry(id.clone()) {
+        let validated_id = MagicTypeId::from_str(&id)
+            .map_err(|e| {
+                debug!(error = %e, "Bad Id.");
+                StatusCode::BAD_REQUEST
+            })?
+            .to_string();
+        match state.status_map.entry(validated_id.clone()) {
             Entry::Occupied(_) => Err(StatusCode::CONFLICT),
             Entry::Vacant(e) => {
                 e.insert(vec![TimestampedStatus {
@@ -61,7 +69,7 @@ impl Admission {
                 }]);
                 Ok(Self {
                     map: state.status_map.clone(),
-                    id,
+                    id: validated_id,
                     committed: false
                 })
             }
@@ -91,7 +99,7 @@ impl From<StatusCode> for Reject {
 
 impl IntoResponse for Reject {
     fn into_response(self) -> Response {
-        debug!(status = %self.0, "Blob rejected");
+        debug!(status = %self.0, "Request is rejected.");
         match self.0 {
             StatusCode::SERVICE_UNAVAILABLE => {
                 (self.0, [(header::RETRY_AFTER, "5")]).into_response()
@@ -152,30 +160,36 @@ async fn get_status(
 async fn get_blob(
     State(state): State<BridgeState>,
     Path(id): Path<String>,
-) -> impl IntoResponse {
-    // todo: validate id
-    let status = state.status_map
-        .get(&id)
-        .map(|status_list| status_list.last().unwrap().status.clone())
-        .unwrap_or(Status::Missing);
-    match status {
-        Status::Finalized  => {
-            StatusCode::ACCEPTED.into_response()
+) -> Result<(StatusCode, String), Reject> {
+    let validated_id = MagicTypeId::from_str(&id)
+        .map_err(|e| {
+            debug!(error = %e, "Bad Id.");
+            StatusCode::BAD_REQUEST
+        })?
+        .to_string();
+    let status = match state.status_map.entry(validated_id.clone()) {
+        Entry::Occupied(e) => {
+            e.get().last().unwrap().status.clone()
+        },
+        Entry::Vacant(e) => {
+            e.insert(vec![TimestampedStatus {
+                at: Instant::now(),
+                status: Status::Missing
+            }]);
+            Status::Missing
         }
-        Status::Missing => {
-            if let Err(e) = state.tx_admission.send(ToPipeline::GetBlob {
-                id: id.clone(),
-            }).await {
-                warn!("Failed to send the get blob message to the blob store: {e:?}");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            }
+    };
 
-            StatusCode::ACCEPTED.into_response()
-        }
-        _  => {
-            (StatusCode::ACCEPTED, Json(status.clone())).into_response()
-        }
+    if matches!(status, Status::Missing) {
+        state.tx_admission
+            .send(ToPipeline::GetBlob { id: validated_id.clone() })
+            .await
+            .map_err(|e| {
+                debug!(error = %e, "Failed to notify the coordinator about a missing blob.");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
     }
+    Ok((StatusCode::ACCEPTED, validated_id))
 }
 
 async fn new_blob(
@@ -195,7 +209,6 @@ async fn new_blob(
     if declared_blob_len > MAX_BLOB_SIZE || num_chunks > TOTAL_CHUNK_BUDGET {
         return Err(StatusCode::PAYLOAD_TOO_LARGE.into())
     }
-    // todo: validate id
     let admission = Admission::new(&state, id.clone())?;
     let allowance = state.admission_budget.clone()
         .try_acquire_many_owned(num_chunks as u32)
@@ -244,7 +257,7 @@ async fn new_blob(
     info!("Admitted a new blob with id(`{id}`), root hash(`{root_hash_str}`), #chunks(`{num_chunks}`), and total size of `{:.1}` MiB",
         declared_blob_len as f32 / 1_048_576f32
     );
-    Ok((StatusCode::CREATED, root_hash_str))
+    Ok((StatusCode::CREATED, id))
 }
 
 pub async fn run(
