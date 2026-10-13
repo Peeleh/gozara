@@ -54,26 +54,26 @@ struct Chunk {
     status: TimestampedStatus
 }
 
-enum Blob {
-    LocalBlob {
-        id: String,
-        root_hash: Hash,
-        merkle_tree: MerkleTree<Blake3>,
-        chunks: HashMap<Hash, Chunk>,
-        allowance: OwnedSemaphorePermit,
-        created_at: Instant,
-    },
-    RemoteBlob {
-        id: String,
-        // pull_status: Vec<(DownloadStatus, Instant)>,
-        expected_chunk_hashes: Vec<Hash>,
-        chunks: HashMap<Hash, Bytes>,
-    }
+struct LocalBlob {
+    id: String,
+    root_hash: Hash,
+    merkle_tree: MerkleTree<Blake3>,
+    chunks: HashMap<Hash, Chunk>,
+    allowance: OwnedSemaphorePermit,
+    created_at: Instant
+}
+
+struct RemoteBlob {
+    // pull_status: Vec<(DownloadStatus, Instant)>,
+    root_hash: Hash,
+    chunk_hashes: Vec<Hash>,
+    chunks: HashMap<Hash, Bytes>,
 }
 
 struct Pipeline {
-    pending_blobs: VecDeque<Blob>,
-    current_blob: Option<Blob>,
+    remote_blobs: HashMap<String, RemoteBlob>,
+    pending_local_blobs: VecDeque<LocalBlob>,
+    current_blob: Option<LocalBlob>,
 
     // record decaying WouldStore gossips
     storage_provider_hints: HashMap<PeerId, Instant>,
@@ -99,7 +99,8 @@ impl Pipeline {
         tx_blob_transfer_events: mpsc::UnboundedSender<blob_transfer::TransferEvent>
     ) -> Self {
         Pipeline {
-            pending_blobs: VecDeque::new(),
+            remote_blobs: HashMap::new(),
+            pending_local_blobs: VecDeque::new(),
             current_blob: None,
             storage_provider_hints: HashMap::new(),
             storage_permits: HashMap::new(),
@@ -126,8 +127,8 @@ impl Pipeline {
                 }
             }))
             .collect();
-        self.pending_blobs.push_back(
-            Blob::LocalBlob {
+        self.pending_local_blobs.push_back(
+            LocalBlob {
                 id: admitted_blob.id,
                 root_hash: admitted_blob.root_hash,
                 merkle_tree: admitted_blob.merkle_tree,
@@ -166,12 +167,10 @@ impl Pipeline {
             // todo: may be a good idea to request storage permits here
             return
         }
-        self.current_blob = self.pending_blobs.pop_front();
+        self.current_blob = self.pending_local_blobs.pop_front();
         if let Some(blob) = self.current_blob.as_ref() {
-            if let Blob::LocalBlob { id, .. } = blob {
-                info!("Started to distribute a new local blob(`{}`).", id);
-                self.request_storage_permits().await;
-            }
+            info!("Started to distribute a new local blob(`{}`).", blob.id);
+            self.request_storage_permits().await;
         } else {
             info!("All blobs are caught up. Waiting for the next...");
         }
@@ -185,10 +184,6 @@ impl Pipeline {
         }
         let Some(blob) = &mut self.current_blob else {
             debug!("No current blob so chunk assignment is finished.");
-            return
-        };
-        let Blob::LocalBlob { chunks, .. } = blob else {
-            debug!("Chunk assignment does not apply here as the current blob is of `remote` kind.");
             return
         };
         let now = Instant::now();
@@ -208,7 +203,11 @@ impl Pipeline {
         };
         let num_peers = peers.len();
         let mut peer_index = 0;
-        for (&hash, chunk) in chunks.iter_mut().filter(|(_, c)| is_eligible(c)).take(num_available_permits) {
+        for (&hash, chunk) in blob.chunks
+            .iter_mut()
+            .filter(|(_, c)| is_eligible(c))
+            .take(num_available_permits)
+        {
             let peer = peers[peer_index];
             let Ok(permit) = self.upload_allowance.clone().try_acquire_owned() else {
                 warn!(%peer, hash = %hash.to_hex(), "Could not get an upload permit for transfer.");
@@ -364,19 +363,12 @@ pub async fn run(
                     Some(msg) => match msg {
                         // remote blob: download chunks and assemble
                         ToPipeline::GetBlob { id } => {
-                            if let Some(Blob::LocalBlob { .. }) = pipeline.current_blob {
-                                // todo
-                            } else {
-                                info!("Blob(`{}`) is missing, scheduled for gathering from remote nodes.", id);
-                                pipeline.pending_blobs.push_back(
-                                    Blob::RemoteBlob {
-                                        id,
-                                        // pull_status: vec![(Status::AwaitingMetadata, Instant::now())],
-                                        expected_chunk_hashes: vec![],
-                                        chunks: HashMap::new(),
-                                    }
-                                );
-                            }
+                            info!("Blob(`{}`) is missing, scheduled for gathering from remote nodes.", id);
+                            pipeline.remote_blobs.insert(id, RemoteBlob {
+                                root_hash: [0u8; 32].into(),
+                                chunk_hashes: vec![],
+                                chunks: HashMap::new()
+                            });
                         }
                         // local blob: chunk and distribute
                         ToPipeline::NewBlob(blob) => {
@@ -398,16 +390,12 @@ pub async fn run(
                             ..
                         } => {
                             let hash_str = hash.to_hex().to_string();
-                            debug!("A new chunk(`{}`) status update(`{:?}`)", hash_str, status);
+                            debug!("A new chunk(`{hash_str}`) status update(`{status:?}`)");
                             let Some(blob) = &mut pipeline.current_blob else {
                                 debug!("No current blob.");
                                 continue
                             };
-                            let Blob::LocalBlob { id, chunks, .. } = blob else {
-                                debug!("The current blob is of `remote` kind.");
-                                continue
-                            };
-                            let Some(chunk) = chunks.get_mut(&hash) else {
+                            let Some(chunk) = blob.chunks.get_mut(&hash) else {
                                 warn!("Chunk is missing.");
                                 continue
                             };
@@ -419,20 +407,20 @@ pub async fn run(
                             match status {
                                 ChunkUploadStatus::Pending => {},
                                 ChunkUploadStatus::Inflight { to } => {
-                                    debug!("Chunk is being sent to Peer(`{}`).", to);
+                                    debug!("Chunk is being sent to Peer(`{to}`).");
                                 },
                                 ChunkUploadStatus::Finalized { owner } => {
-                                    debug!("Chunk has been successfully uploaded to peer(`{}`).", owner);
-                                    let is_finalized = chunks
+                                    debug!("Chunk has been successfully uploaded to peer(`{owner}`).");
+                                    let is_finalized = blob.chunks
                                         .values()
                                         .all(|chunk| matches!(chunk.status.status, ChunkUploadStatus::Finalized { .. }));
                                     if is_finalized {
-                                        info!("Blob(`{}`) is now stored globally.", id);
+                                        info!("Blob(`{}`) is now stored globally.", blob.id);
                                         if let Err(e) = tx_bridge.send(ToBridge::UpdateStatus {
-                                            id: id.to_string(),
+                                            id: blob.id.clone(),
                                             status: BridgeStatus::Finalized
                                         }).await {
-                                            warn!("Failed to send the Finalized status to the bridge channel: {e:?}");
+                                            warn!(error = %e, "Failed to send the Finalized status to the bridge channel");
                                         }
                                         let _ = pipeline.archive_cur_blob();
                                         pipeline.begin_next_blob().await;

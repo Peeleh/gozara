@@ -157,6 +157,7 @@ async fn get_status(
     }
 }
 
+// to assemble from remote nodes
 async fn get_blob(
     State(state): State<BridgeState>,
     Path(id): Path<String>,
@@ -174,24 +175,35 @@ async fn get_blob(
         Entry::Vacant(e) => {
             e.insert(vec![TimestampedStatus {
                 at: Instant::now(),
-                status: Status::Missing
+                status: Status::Pending
             }]);
-            Status::Missing
+            Status::Pending
         }
     };
 
-    if matches!(status, Status::Missing) {
-        state.tx_admission
-            .send(ToPipeline::GetBlob { id: validated_id.clone() })
-            .await
-            .map_err(|e| {
-                debug!(error = %e, "Failed to notify the coordinator about a missing blob.");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+    match status {
+        Status::Pending => {
+            state.tx_admission
+                .send(ToPipeline::GetBlob { id: validated_id.clone() })
+                .await
+                .map_err(|e| {
+                    debug!(error = %e, "Failed to notify the coordinator about a missing blob.");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            return Ok((StatusCode::ACCEPTED, validated_id))
+        }
+        Status::Finalized => {
+            // todo: gather blob info
+            return Ok((StatusCode::OK, validated_id))
+        }
+        Status::Failed { reason } => {
+            // todo: failed blobs should be evicted from the statu map after a while to allow retry
+            return Ok((StatusCode::OK, reason.unwrap_or_else(|| "".to_string())))
+        }
     }
-    Ok((StatusCode::ACCEPTED, validated_id))
 }
 
+// to distribute 
 async fn new_blob(
     State(state): State<BridgeState>,
     Path(id): Path<String>,
@@ -270,8 +282,8 @@ pub async fn run(
     let shutdown_bridge = shutdown.clone();
     let app = Router::new()
         .route("/status/{id}", get(get_status))
+        .route("/blob/{id}", get(get_blob))
         .route("/blob/{id}", post(new_blob))
-        // .route("/getblob/{id}", get(get_blob))
         .with_state(state_server);
     const ADDR: &str = "127.0.0.1:8709";
     let listener = tokio::net::TcpListener::bind(ADDR).await?;
