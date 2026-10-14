@@ -46,6 +46,16 @@ struct TimestampedStatus {
     status: Status,
 }
 
+fn validate_id(id: &str) -> Result<String, StatusCode> {
+    let validated_id = MagicTypeId::from_str(&id)
+        .map_err(|e| {
+            debug!(error = %e, id = %id, "Bad Id.");
+            StatusCode::BAD_REQUEST
+        })?
+        .to_string();
+    Ok(validated_id)
+}
+
 struct Admission {
     map: Arc<DashMap<String, Vec<TimestampedStatus>>>,
     id: String,
@@ -54,12 +64,7 @@ struct Admission {
 
 impl Admission {
     fn new(state: &BridgeState, id: String) -> Result<Self, StatusCode> {
-        let validated_id = MagicTypeId::from_str(&id)
-            .map_err(|e| {
-                debug!(error = %e, "Bad Id.");
-                StatusCode::BAD_REQUEST
-            })?
-            .to_string();
+        let validated_id = validate_id(&id)?;
         match state.status_map.entry(validated_id.clone()) {
             Entry::Occupied(_) => Err(StatusCode::CONFLICT),
             Entry::Vacant(e) => {
@@ -162,12 +167,7 @@ async fn get_blob(
     State(state): State<BridgeState>,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, String), Reject> {
-    let validated_id = MagicTypeId::from_str(&id)
-        .map_err(|e| {
-            debug!(error = %e, "Bad Id.");
-            StatusCode::BAD_REQUEST
-        })?
-        .to_string();
+    let validated_id = validate_id(&id)?;
     let status = match state.status_map.entry(validated_id.clone()) {
         Entry::Occupied(e) => {
             e.get().last().unwrap().status.clone()
