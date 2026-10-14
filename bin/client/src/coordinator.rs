@@ -35,7 +35,7 @@ enum InternalMessage {
 
 #[derive(Debug, Clone)]
 enum ChunkUploadStatus {
-        Pending,
+    Pending,
     Inflight {
         to: PeerId,
     },

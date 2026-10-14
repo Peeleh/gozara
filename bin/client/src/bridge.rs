@@ -22,12 +22,12 @@ use axum::{
     body::{Body, Bytes},
     extract::{Path, State},
     http::{header, StatusCode},
-    routing::{get, post},
+    routing::get,
     Router,
-    response::{Json, Response, IntoResponse}
+    response::{Response, IntoResponse}
 };
-use mti::prelude::*;
-// use std::str::FromStr;
+use mti::prelude::MagicTypeId;
+use std::str::FromStr;
 use crate::blake3_wrapper::Blake3;
 use crate::admission::{Status, ToPipeline, ToBridge, AdmittedBlob, CHUNK_SIZE};
 
@@ -95,7 +95,7 @@ impl Drop for Admission {
     }
 }
 
-// Error type for the new_blob: status code + 'Retry-After: 5' on 503
+// Error type: status code + 'Retry-After: 5' on 503
 struct Reject(StatusCode);
 
 impl From<StatusCode> for Reject {
@@ -152,13 +152,14 @@ impl BridgeState {
 async fn get_status(
     State(state): State<BridgeState>,
     Path(id): Path<String>
-) -> impl IntoResponse {
-    match state.status_map.get(&id) {
+) -> Result<(StatusCode, String), Reject> {
+    let validated_id = validate_id(&id)?;
+    match state.status_map.get(&validated_id) {
         Some(status_list) => {
-            let most_recent_status = &status_list.last().unwrap().status;
-            (StatusCode::OK, Json(most_recent_status)).into_response()
+            let most_recent_status = format!("{:?}", status_list.last().unwrap().status);
+            Ok((StatusCode::FOUND, most_recent_status))
         }
-        None => StatusCode::NOT_FOUND.into_response()
+        None => Err(Reject(StatusCode::NOT_FOUND))
     }
 }
 
@@ -168,6 +169,7 @@ async fn get_blob(
     Path(id): Path<String>,
 ) -> Result<(StatusCode, String), Reject> {
     let validated_id = validate_id(&id)?;
+    let mut notify = false;
     let status = match state.status_map.entry(validated_id.clone()) {
         Entry::Occupied(e) => {
             e.get().last().unwrap().status.clone()
@@ -177,39 +179,43 @@ async fn get_blob(
                 at: Instant::now(),
                 status: Status::Pending
             }]);
+            notify = true;
             Status::Pending
         }
     };
 
     match status {
         Status::Pending => {
-            state.tx_admission
-                .send(ToPipeline::GetBlob { id: validated_id.clone() })
-                .await
-                .map_err(|e| {
-                    debug!(error = %e, "Failed to notify the coordinator about a missing blob.");
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-            return Ok((StatusCode::ACCEPTED, validated_id))
+            if notify {
+                state.tx_admission
+                    .send(ToPipeline::GetBlob { id: validated_id.clone() })
+                    .await
+                    .map_err(|e| {
+                        debug!(error = %e, "Failed to notify the coordinator about a missing blob.");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+            }
+            Ok((StatusCode::ACCEPTED, validated_id))
         }
         Status::Finalized => {
             // todo: gather blob info
-            return Ok((StatusCode::OK, validated_id))
+            Ok((StatusCode::OK, validated_id))
         }
         Status::Failed { reason } => {
-            // todo: failed blobs should be evicted from the statu map after a while to allow retry
-            return Ok((StatusCode::OK, reason.unwrap_or_else(|| "".to_string())))
+            // todo: failed blobs should be evicted from the status map after a while to allow retry
+            Ok((StatusCode::BAD_GATEWAY, reason.unwrap_or_default()))
         }
     }
 }
 
-// to distribute 
+// to distribute
 async fn new_blob(
     State(state): State<BridgeState>,
     Path(id): Path<String>,
     headers: header::HeaderMap,
     body: Body
 ) -> Result<(StatusCode, String), Reject> {
+    let validated_id = validate_id(&id)?;
     // check for blob size first and whether we have enough budget to admit it
     let declared_blob_len: usize = headers.get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok()?.parse().ok())
@@ -221,7 +227,7 @@ async fn new_blob(
     if declared_blob_len > MAX_BLOB_SIZE || num_chunks > TOTAL_CHUNK_BUDGET {
         return Err(StatusCode::PAYLOAD_TOO_LARGE.into())
     }
-    let admission = Admission::new(&state, id.clone())?;
+    let admission = Admission::new(&state, validated_id.clone())?;
     let allowance = state.admission_budget.clone()
         .try_acquire_many_owned(num_chunks as u32)
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -262,14 +268,14 @@ async fn new_blob(
         .into();
     let root_hash_str = root_hash.to_hex().to_string();
     state.tx_admission
-        .send(ToPipeline::NewBlob(AdmittedBlob { id: id.clone(), root_hash, merkle_tree, chunks, allowance }))
+        .send(ToPipeline::NewBlob(AdmittedBlob { id: validated_id.clone(), root_hash, merkle_tree, chunks, allowance }))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     admission.commit();
     info!("Admitted a new blob with id(`{id}`), root hash(`{root_hash_str}`), #chunks(`{num_chunks}`), and total size of `{:.1}` MiB",
         declared_blob_len as f32 / 1_048_576f32
     );
-    Ok((StatusCode::CREATED, id))
+    Ok((StatusCode::CREATED, validated_id))
 }
 
 pub async fn run(
@@ -282,8 +288,7 @@ pub async fn run(
     let shutdown_bridge = shutdown.clone();
     let app = Router::new()
         .route("/status/{id}", get(get_status))
-        .route("/blob/{id}", get(get_blob))
-        .route("/blob/{id}", post(new_blob))
+        .route("/blob/{id}", get(get_blob).post(new_blob))
         .with_state(state_server);
     const ADDR: &str = "127.0.0.1:8709";
     let listener = tokio::net::TcpListener::bind(ADDR).await?;
