@@ -19,6 +19,7 @@ use crate::admission::{
 };
 use crate::blake3_wrapper::Blake3;
 use peyk::{blob_transfer, HandlerMessage, SwarmMessage};
+use common::types::{Timestamped, BlobMetadata};
 
 // 30 seconds
 const CHUNK_UPLOAD_WINDOW: u64 = 30;
@@ -44,19 +45,15 @@ enum ChunkUploadStatus {
     }
 }
 
-struct TimestampedStatus {
-    at: Instant,
-    status: ChunkUploadStatus
-}
-
 struct Chunk {
     data: Bytes,
-    status: TimestampedStatus
+    status: Timestamped<ChunkUploadStatus>,
 }
 
 struct LocalBlob {
     id: String,
     root_hash: Hash,
+    merkle_leaves: Vec<[u8; 32]>,
     merkle_tree: MerkleTree<Blake3>,
     chunks: HashMap<Hash, Chunk>,
     allowance: OwnedSemaphorePermit,
@@ -121,8 +118,8 @@ impl Pipeline {
             .into_iter()
             .map(|(hash, data)| (hash, Chunk {
                 data,
-                status: TimestampedStatus {
-                    status: ChunkUploadStatus::Pending,
+                status: Timestamped::<ChunkUploadStatus> {
+                    value: ChunkUploadStatus::Pending,
                     at: Instant::now()
                 }
             }))
@@ -131,6 +128,7 @@ impl Pipeline {
             LocalBlob {
                 id: admitted_blob.id,
                 root_hash: admitted_blob.root_hash,
+                merkle_leaves: admitted_blob.merkle_leaves,
                 merkle_tree: admitted_blob.merkle_tree,
                 chunks: chunks_map,
                 allowance: admitted_blob.allowance,
@@ -153,7 +151,7 @@ impl Pipeline {
         let now = Instant::now();
         self.storage_permits.retain(|_, expires_at| *expires_at > now);
         if !self.storage_permits.is_empty() {
-            // todo: check if there are enough permits
+                // todo: check if there are enough permits
             return
         }
         // todo: peers size should not be large
@@ -196,7 +194,7 @@ impl Pipeline {
             warn!("No eligible peers to assign.");
             return
         }
-        let is_eligible = |c: &Chunk| match c.status.status {
+        let is_eligible = |c: &Chunk| match c.status.value {
             ChunkUploadStatus::Pending => true,
             ChunkUploadStatus::Inflight { .. }  => now.duration_since(c.status.at).as_secs() > CHUNK_UPLOAD_WINDOW,
             ChunkUploadStatus::Finalized { .. } => false
@@ -213,8 +211,8 @@ impl Pipeline {
                 warn!(%peer, hash = %hash.to_hex(), "Could not get an upload permit for transfer.");
                 break
             };
-            chunk.status = TimestampedStatus {
-                status: ChunkUploadStatus::Inflight { to: peer },
+            chunk.status = Timestamped::<ChunkUploadStatus> {
+                value: ChunkUploadStatus::Inflight { to: peer },
                 at: now
             };
             let control = self.blob_transfer_control.clone();
@@ -363,12 +361,17 @@ pub async fn run(
                     Some(msg) => match msg {
                         // remote blob: download chunks and assemble
                         ToPipeline::GetBlob { id } => {
-                            info!("Blob(`{}`) is missing, scheduled for gathering from remote nodes.", id);
-                            pipeline.remote_blobs.insert(id, RemoteBlob {
-                                root_hash: [0u8; 32].into(),
-                                chunk_hashes: vec![],
-                                chunks: HashMap::new()
-                            });
+                            let blob = pipeline
+                                .remote_blobs
+                                .entry(id.clone())
+                                .or_insert_with (|| {
+                                    info!(blob = %id, "Scheduled for gathering from remote nodes.");
+                                    RemoteBlob {
+                                        root_hash: [0u8; 32].into(),
+                                        chunk_hashes: vec![],
+                                        chunks: HashMap::new()
+                                    }
+                                });
                         }
                         // local blob: chunk and distribute
                         ToPipeline::NewBlob(blob) => {
@@ -400,9 +403,9 @@ pub async fn run(
                                 continue
                             };
                             // todo: keep track of previous updates and test for healthy transition
-                            chunk.status = TimestampedStatus {
-                                at: Instant::now(),
-                                status: status.clone()
+                            chunk.status = Timestamped::<ChunkUploadStatus> {
+                                value: status.clone(),
+                                at: Instant::now()
                             };
                             match status {
                                 ChunkUploadStatus::Pending => {},
@@ -413,7 +416,7 @@ pub async fn run(
                                     debug!("Chunk has been successfully uploaded to peer(`{owner}`).");
                                     let is_finalized = blob.chunks
                                         .values()
-                                        .all(|chunk| matches!(chunk.status.status, ChunkUploadStatus::Finalized { .. }));
+                                        .all(|chunk| matches!(chunk.status.value, ChunkUploadStatus::Finalized { .. }));
                                     if is_finalized {
                                         info!("Blob(`{}`) is now stored globally.", blob.id);
                                         if let Err(e) = tx_bridge.send(ToBridge::UpdateStatus {

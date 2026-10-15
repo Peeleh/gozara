@@ -1,5 +1,5 @@
 use std::{
-    time::{Instant, Duration},
+    time::Duration,
     sync::Arc,
 };
 use futures::StreamExt;
@@ -7,7 +7,7 @@ use eyre::Result;
 use tracing::{info, warn, debug};
 use tokio::{
     sync::{mpsc, Semaphore},
-    time::timeout,
+    time::{Instant, timeout},
     task,
 };
 use tokio_util::sync::CancellationToken;
@@ -30,6 +30,7 @@ use mti::prelude::MagicTypeId;
 use std::str::FromStr;
 use crate::blake3_wrapper::Blake3;
 use crate::admission::{Status, ToPipeline, ToBridge, AdmittedBlob, CHUNK_SIZE};
+use common::types::Timestamped;
 
 // 1 GiB
 const MAX_BLOB_SIZE: usize = 1 << 30;
@@ -39,12 +40,6 @@ const TOTAL_CHUNK_BUDGET: usize = 1536;
 
 // max silence between frames
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[derive(Clone, Debug)]
-struct TimestampedStatus {
-    at: Instant,
-    status: Status,
-}
 
 fn validate_id(id: &str) -> Result<String, StatusCode> {
     let validated_id = MagicTypeId::from_str(&id)
@@ -57,7 +52,7 @@ fn validate_id(id: &str) -> Result<String, StatusCode> {
 }
 
 struct Admission {
-    map: Arc<DashMap<String, Vec<TimestampedStatus>>>,
+    map: Arc<DashMap<String, Vec<Timestamped<Status>>>>,
     id: String,
     committed: bool
 }
@@ -68,9 +63,9 @@ impl Admission {
         match state.status_map.entry(validated_id.clone()) {
             Entry::Occupied(_) => Err(StatusCode::CONFLICT),
             Entry::Vacant(e) => {
-                e.insert(vec![TimestampedStatus {
+                e.insert(vec![Timestamped::<Status> {
+                    value: Status::Pending,
                     at: Instant::now(),
-                    status: Status::Pending
                 }]);
                 Ok(Self {
                     map: state.status_map.clone(),
@@ -134,7 +129,7 @@ async fn hash_chunk(
 struct BridgeState {
     hashing: Arc<Semaphore>,
     admission_budget: Arc<Semaphore>,
-    status_map: Arc<DashMap<String, Vec<TimestampedStatus>>>,
+    status_map: Arc<DashMap<String, Vec<Timestamped<Status>>>>,
     tx_admission: mpsc::Sender<ToPipeline>,
 }
 
@@ -156,7 +151,7 @@ async fn get_status(
     let validated_id = validate_id(&id)?;
     match state.status_map.get(&validated_id) {
         Some(status_list) => {
-            let most_recent_status = format!("{:?}", status_list.last().unwrap().status);
+            let most_recent_status = format!("{:?}", status_list.last().unwrap().value);
             Ok((StatusCode::FOUND, most_recent_status))
         }
         None => Err(Reject(StatusCode::NOT_FOUND))
@@ -172,12 +167,12 @@ async fn get_blob(
     let mut notify = false;
     let status = match state.status_map.entry(validated_id.clone()) {
         Entry::Occupied(e) => {
-            e.get().last().unwrap().status.clone()
+            e.get().last().unwrap().value.clone()
         },
         Entry::Vacant(e) => {
-            e.insert(vec![TimestampedStatus {
-                at: Instant::now(),
-                status: Status::Pending
+            e.insert(vec![Timestamped::<Status> {
+                value: Status::Pending,
+                at: Instant::now()
             }]);
             notify = true;
             Status::Pending
@@ -268,7 +263,11 @@ async fn new_blob(
         .into();
     let root_hash_str = root_hash.to_hex().to_string();
     state.tx_admission
-        .send(ToPipeline::NewBlob(AdmittedBlob { id: validated_id.clone(), root_hash, merkle_tree, chunks, allowance }))
+        .send(ToPipeline::NewBlob(AdmittedBlob {
+            id: validated_id.clone(),
+            root_hash, merkle_leaves: leaves, merkle_tree,
+            chunks, allowance
+        }))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     admission.commit();
@@ -320,7 +319,7 @@ pub async fn run(
                                 match state.status_map.entry(id.clone()) {
                                     Entry::Occupied(mut entry) => {
                                         entry.get_mut().push(
-                                            TimestampedStatus { at: Instant::now(), status }
+                                            Timestamped::<Status> { value: status, at: Instant::now() }
                                         );
                                     }
                                     Entry::Vacant(_) => {
