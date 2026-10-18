@@ -26,3 +26,4 @@ bincode.workspace = true
 bytes.workspace = true
 blake3.workspace = true
 hex.workspace = true
+common.workspace = true

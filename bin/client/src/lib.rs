@@ -124,7 +124,7 @@ pub async fn run(
 ) -> Result<()> {
     let swarm = go_public(config)?;
     let blob_transfer_control = swarm.behaviour().blob_stream.new_control();
-    let (tx_swarm, rx_swarm) = mpsc::channel::<peyk::SwarmMessage>(16);
+    let (tx_swarm, rx_swarm) = mpsc::channel::<peyk::ToSwarm>(16);
     let (tx_handler, rx_handler) = mpsc::channel::<peyk::HandlerMessage>(256);
     let (tx_admission, rx_admission) = mpsc::channel::<admission::ToPipeline>(16);
     let (tx_bridge, rx_bridge) = mpsc::channel::<admission::ToBridge>(128);

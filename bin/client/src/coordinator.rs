@@ -18,23 +18,25 @@ use crate::admission::{
     ToPipeline, ToBridge, AdmittedBlob, CHUNK_SIZE
 };
 use crate::blake3_wrapper::Blake3;
-use peyk::{blob_transfer, HandlerMessage, SwarmMessage};
-use common::types::{Timestamped, BlobMetadata};
+use peyk::{blob_transfer, HandlerMessage, ToSwarm};
+use common::types::{Timestamped, BlobManifest};
 
 // 30 seconds
 const CHUNK_UPLOAD_WINDOW: u64 = 30;
 // provider hints are valid for 5 minutes
 const STORAGE_PROVIDER_DECAY: u64 = 5 * 60;
+// 4 hours
+const BLOB_RECORD_TTL: u64 = 4 * 3600;
+
 
 enum InternalMessage {
     UpdateChunkStatus {
         hash: Hash,
-        status: ChunkUploadStatus,
-        at: Instant
+        status: Timestamped<ChunkUploadStatus>,
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum ChunkUploadStatus {
     Pending,
     Inflight {
@@ -60,6 +62,14 @@ struct LocalBlob {
     created_at: Instant
 }
 
+impl LocalBlob {
+    fn is_finalized(&self) -> bool {
+        self.chunks
+            .values()
+            .all(|chunk| matches!(chunk.status.value, ChunkUploadStatus::Finalized { .. }))
+    }
+}
+
 struct RemoteBlob {
     // pull_status: Vec<(DownloadStatus, Instant)>,
     root_hash: Hash,
@@ -78,7 +88,7 @@ struct Pipeline {
 
     tx_internal: mpsc::UnboundedSender<InternalMessage>,
 
-    tx_swarm: mpsc::Sender<SwarmMessage>,
+    tx_swarm: mpsc::Sender<ToSwarm>,
 
     blob_transfer_control: peyk::Control,
     tx_blob_transfer_events: mpsc::UnboundedSender<blob_transfer::TransferEvent>,
@@ -91,7 +101,7 @@ struct Pipeline {
 impl Pipeline {
     fn new(
         tx_internal: mpsc::UnboundedSender<InternalMessage>,
-        tx_swarm: mpsc::Sender<SwarmMessage>,
+        tx_swarm: mpsc::Sender<ToSwarm>,
         blob_transfer_control: peyk::Control,
         tx_blob_transfer_events: mpsc::UnboundedSender<blob_transfer::TransferEvent>
     ) -> Self {
@@ -137,10 +147,24 @@ impl Pipeline {
         );
     }
 
-    fn archive_cur_blob(&mut self) -> Result<()> {
-        let _blob = self.current_blob.take().unwrap();
-        // todo: archive the blob
-        Ok(())
+    async fn post_finalization(&mut self) {
+        let blob = self.current_blob.take().unwrap();
+        // upload manifest to kademlia as a record
+        let manifest = BlobManifest {
+            root_hash: blob.root_hash.into(),
+            chunks: blob.merkle_leaves.clone()
+        };
+        if let Err(e) = self.tx_swarm.send(ToSwarm::PublishManifest {
+            blob_id: blob.id.clone(),
+            manifest,
+            expires_at: Instant::now().checked_add(
+                Duration::from_secs(BLOB_RECORD_TTL)
+            ).unwrap_or(Instant::now()) // noop
+        }).await {
+            warn!(blob = %blob.id, error = %e, "Failed to send the manifest to the Swarm channel.");
+        }
+
+        // todo: archive the blob to the db
     }
 
     async fn request_storage_permits(&mut self) {
@@ -155,7 +179,7 @@ impl Pipeline {
             return
         }
         // todo: peers size should not be large
-        let _ = self.tx_swarm.send(SwarmMessage::RequestStoragePermits {
+        let _ = self.tx_swarm.send(ToSwarm::RequestStoragePermits {
             peers: self.storage_provider_hints.keys().cloned().collect()
         }).await;
     }
@@ -233,8 +257,10 @@ impl Pipeline {
                         debug!(chunk = %hash_str, %peer, dur = now.elapsed().as_secs_f32(), "upload finished successfully.");
                         let _ = tx_internal.send(InternalMessage::UpdateChunkStatus {
                             hash,
-                            status: ChunkUploadStatus::Finalized { owner: peer },
-                            at: Instant::now(),
+                            status: Timestamped::<ChunkUploadStatus> {
+                                value: ChunkUploadStatus::Finalized { owner: peer },
+                                at: Instant::now()
+                            }
                         });
                     }
                     Ok(Err(e)) => {
@@ -244,8 +270,10 @@ impl Pipeline {
                         );
                         let _ = tx_internal.send(InternalMessage::UpdateChunkStatus {
                             hash,
-                            status: ChunkUploadStatus::Pending,
-                            at: Instant::now(),
+                            status: Timestamped::<ChunkUploadStatus> {
+                                value: ChunkUploadStatus::Pending,
+                                at: Instant::now(),
+                            }
                         });
                     }
                     Err(_) => {
@@ -265,7 +293,7 @@ impl Pipeline {
 pub async fn run(
     mut rx_admission: mpsc::Receiver<ToPipeline>,
     mut rx_handler: mpsc::Receiver<HandlerMessage>,
-    tx_swarm: mpsc::Sender<SwarmMessage>,
+    tx_swarm: mpsc::Sender<ToSwarm>,
     tx_bridge: mpsc::Sender<ToBridge>,
     mut blob_transfer_control: peyk::Control,
     shutdown: CancellationToken,
@@ -316,25 +344,14 @@ pub async fn run(
                     Some(h_msg) => {
                         match h_msg {
                             // a gossip by storage providers
-                            HandlerMessage::WouldStore {
-                                peer_id,
-                            } => {
+                            HandlerMessage::WouldStore { peer_id } => {
                                 pipeline
                                     .storage_provider_hints
                                     .insert(peer_id, Instant::now());
                             }
-                            HandlerMessage::Request {
-                                peer_id,
-                                request_id,
-                                request,
-                                channel
-                            } => {
+                            HandlerMessage::Request { peer_id, request_id, request, channel } => {
                             }
-                            HandlerMessage::Response {
-                                peer_id,
-                                request_id,
-                                response
-                            } => {
+                            HandlerMessage::Response { peer_id, request_id, response } => {
                                 match response {
                                     peyk::protocol::Response::IssuedStoragePermit { valid_for } => {
                                         let now = Instant::now();
@@ -348,6 +365,9 @@ pub async fn run(
                                     }
                                     peyk::protocol::Response::BlobMeta {..} => {}
                                 }
+                            }
+                            HandlerMessage::PublishManifestResult { blob_id, succeeded } => {
+                                // todo: update db and follow up for the failed result
                             }
                         }
                     }
@@ -389,8 +409,7 @@ pub async fn run(
                     Some(i_msg) => match i_msg {
                         InternalMessage::UpdateChunkStatus {
                             hash,
-                            status,
-                            ..
+                            status
                         } => {
                             let hash_str = hash.to_hex().to_string();
                             debug!("A new chunk(`{hash_str}`) status update(`{status:?}`)");
@@ -403,21 +422,16 @@ pub async fn run(
                                 continue
                             };
                             // todo: keep track of previous updates and test for healthy transition
-                            chunk.status = Timestamped::<ChunkUploadStatus> {
-                                value: status.clone(),
-                                at: Instant::now()
-                            };
-                            match status {
+                            let status_value = status.value;
+                            chunk.status = status;
+                            match status_value {
                                 ChunkUploadStatus::Pending => {},
                                 ChunkUploadStatus::Inflight { to } => {
                                     debug!("Chunk is being sent to Peer(`{to}`).");
                                 },
                                 ChunkUploadStatus::Finalized { owner } => {
                                     debug!("Chunk has been successfully uploaded to peer(`{owner}`).");
-                                    let is_finalized = blob.chunks
-                                        .values()
-                                        .all(|chunk| matches!(chunk.status.value, ChunkUploadStatus::Finalized { .. }));
-                                    if is_finalized {
+                                    if blob.is_finalized() {
                                         info!("Blob(`{}`) is now stored globally.", blob.id);
                                         if let Err(e) = tx_bridge.send(ToBridge::UpdateStatus {
                                             id: blob.id.clone(),
@@ -425,7 +439,7 @@ pub async fn run(
                                         }).await {
                                             warn!(error = %e, "Failed to send the Finalized status to the bridge channel");
                                         }
-                                        let _ = pipeline.archive_cur_blob();
+                                        pipeline.post_finalization().await;
                                         pipeline.begin_next_blob().await;
                                     }
                                     pipeline.assign_chunks();

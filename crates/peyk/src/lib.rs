@@ -20,18 +20,24 @@ use libp2p::{
 };
 use tokio::{
     sync::{mpsc},
-    time::interval,
+    time::{Instant, interval},
     task::JoinHandle
 };
 use tokio_util::sync::CancellationToken;
 use tokio_stream::wrappers::IntervalStream;
-pub use libp2p_stream::Control;
+use common::types::BlobManifest;
 use p2p::{GlobalBehaviour, GlobalBehaviourEvent};
+pub use libp2p_stream::Control;
 
-pub enum SwarmMessage {
+pub enum ToSwarm {
     RequestStoragePermits { 
         peers: Vec<PeerId>,
-    }, 
+    },
+    PublishManifest {
+        blob_id: String,
+        manifest: BlobManifest,
+        expires_at: Instant
+    }
 }
 
 // consumers handle inbound messages
@@ -49,12 +55,18 @@ pub enum HandlerMessage {
         peer_id: PeerId,
         request_id: request_response::OutboundRequestId,
         response: protocol::Response
-    }    
+    },
+    PublishManifestResult {
+        blob_id: String,
+        succeeded: bool,
+    }
 }
+
+const BLOB_MANIFEST_NAMESPACE: &[u8] = b"/gozara/manifest/blob/";
 
 pub async fn process_swarm(
     mut swarm: Swarm<GlobalBehaviour>,
-    mut rx: mpsc::Receiver<SwarmMessage>,
+    mut rx: mpsc::Receiver<ToSwarm>,
     tx_handler: mpsc::Sender<HandlerMessage>,
     shutdown: CancellationToken,
 ) -> Result<JoinHandle<()>> {
@@ -79,24 +91,48 @@ pub async fn process_swarm(
                         .kademlia
                         .get_closest_peers(random_peer_id);
                 },
-
-                // blob events
+                // ToSwarm messages
                 r = rx.recv() =>  match r {
-                    Some(sw_req) => {
-                        match sw_req {
-                            SwarmMessage::RequestStoragePermits { 
-                                peers
-                            } => {
-                                for peer in peers.iter() {
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .req_resp
-                                        .send_request(
-                                            peer,
-                                            protocol::Request::StoragePermit
-                                        );
-                                }
+                    Some(m) => match m {
+                        ToSwarm::RequestStoragePermits { peers } => {
+                            for peer in peers.iter() {
+                                let _ = swarm
+                                    .behaviour_mut()
+                                    .req_resp
+                                    .send_request(
+                                        peer,
+                                        protocol::Request::StoragePermit
+                                    );
                             }
+                        }
+                        ToSwarm::PublishManifest { blob_id, manifest, expires_at } => {
+                            let value = match bincode::serialize(&manifest) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!(blob = %blob_id, error = %e, "Failed to serialize the given manifest.");
+                                    continue
+                                }
+                            };
+                            let key = kad::RecordKey::new(&[BLOB_MANIFEST_NAMESPACE, blob_id.as_bytes()].concat());
+                            let record = kad::Record {
+                                key: key,
+                                value: value,
+                                publisher: Some(*swarm.local_peer_id()),
+                                expires: Some(expires_at.into())
+                            };
+                            let query_id = match swarm
+                                .behaviour_mut()
+                                .kademlia
+                                .put_record(record, kad::Quorum::One)
+                            {
+                                Ok(qid) => qid,
+                                Err(e) => {
+                                    warn!(blob = %blob_id, error = %e, "Failed to put the manifest record on DHT.");
+                                    continue
+                                }
+                            };
+                            debug!(blob = %blob_id, query = %query_id, "Publish manifest is initiated.");
+                            // todo: follow up
                         }
                     }
                     None => {
@@ -144,7 +180,8 @@ pub async fn process_swarm(
                             .all(|a| !a.is_private() && !a.is_loopback());
                         if is_public {                        
                             debug!("Added public address of the peer to the DHT: {}", address);
-                            swarm.behaviour_mut()
+                            swarm
+                                .behaviour_mut()
                                 .kademlia
                                 .add_address(&peer_id, address);
                         }                      
@@ -169,33 +206,51 @@ pub async fn process_swarm(
                         result: kad::QueryResult::GetClosestPeers(Ok(ok)),
                         ..
                     })) => {
-                        debug!("Query for the closest peers is finished: {:?}", ok.peers);
+                        debug!("Query for the closest peers lookup is finished: {:?}", ok.peers);
                     }
                     SwarmEvent::Behaviour(GlobalBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
-                        result:
-                            kad::QueryResult::GetClosestPeers(Err(kad::GetClosestPeersError::Timeout {
-                                ..
-                            })),
+                        result: kad::QueryResult::GetClosestPeers(Err(kad::GetClosestPeersError::Timeout { .. })),
                         ..
                     })) => {
                         debug!("Query for the closest peers timed out.");
                     }
-                    // SwarmEvent::Behaviour(GlobalBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
-                    //     result: kad::QueryResult::GetProviders(
-                    //         Ok(
-                    //             kad::GetProvidersOk::FoundProviders{ mut providers, .. }
-                    //         )
-                    //     ),
-                    //     ..
-                    // })) => {
-                    //     providers.remove(&my_peer_id);
-                    //     info!("providers: {:?}", providers);
-                    //     for peer_id in providers {
-                    //         let res = swarm.dial(peer_id);
-                    //         info!("dial result: {:?}", res);
-                    //     }
-                    // },
-
+                    SwarmEvent::Behaviour(GlobalBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
+                        id: query_id,
+                        result: kad::QueryResult::PutRecord(Ok(kad::PutRecordOk{ key })),
+                        stats,
+                        ..
+                    })) => {
+                        let Some(id) = key.as_ref().strip_prefix(BLOB_MANIFEST_NAMESPACE) else {
+                            continue
+                        };
+                        debug!(key = ?key, query = %query_id, stats = ?stats, "PutRecord was successful.");
+                        let Ok(blob_id) = String::from_utf8(id.to_owned()) else {
+                            continue
+                        };
+                        let _ = tx_handler.send(HandlerMessage::PublishManifestResult {
+                            blob_id,
+                            succeeded: true
+                        });
+                    }
+                    SwarmEvent::Behaviour(GlobalBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
+                        id: query_id,
+                        result: kad::QueryResult::PutRecord(Err(e)),
+                        stats,
+                        ..
+                    })) => {
+                        let key = e.key();
+                        let Some(id) = key.as_ref().strip_prefix(BLOB_MANIFEST_NAMESPACE) else {
+                            continue
+                        };
+                        debug!(key = ?key, query = %query_id, stats = ?stats, "PutRecord failed.");
+                        let Ok(blob_id) = String::from_utf8(id.to_owned()) else {
+                            continue
+                        };
+                        let _ = tx_handler.send(HandlerMessage::PublishManifestResult {
+                            blob_id,
+                            succeeded: false
+                        });
+                    }
                     // <protocol>
                     SwarmEvent::Behaviour(GlobalBehaviourEvent::ReqResp(request_response::Event::Message {
                         peer: peer_id,

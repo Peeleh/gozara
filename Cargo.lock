@@ -652,7 +652,6 @@ name = "common"
 version = "0.1.0"
 dependencies = [
  "futures",
- "libp2p",
  "serde",
  "tokio",
  "tokio-util",
@@ -2736,6 +2735,7 @@ dependencies = [
  "bincode",
  "blake3",
  "bytes",
+ "common",
  "eyre",
  "futures",
  "hex",
