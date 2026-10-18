@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "bin/bootnode",    
-    "bin/client",
+    "bin/portal",
     "crates/peyk",
     "crates/common"
 ]

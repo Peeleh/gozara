@@ -37,7 +37,8 @@ pub enum ToSwarm {
         blob_id: String,
         manifest: BlobManifest,
         expires_at: Instant
-    }
+    },
+    
 }
 
 // consumers handle inbound messages

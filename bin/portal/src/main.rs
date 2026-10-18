@@ -1,4 +1,4 @@
-use client::Config;
+use portal::Config;
 use std::env;
 // use opentelemetry_sdk::Resource;
 use tracing::info;
@@ -36,6 +36,6 @@ async fn main() -> Result<()> {
     };
     let token = CancellationToken::new();
     tokio::spawn(wait_for_shutdown_signal(token.clone()));
-    client::run(cfg, token).await?;
+    portal::run(cfg, token).await?;
     Ok(())
 }

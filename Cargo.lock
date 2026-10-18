@@ -584,39 +584,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
-name = "client"
-version = "0.1.0"
-dependencies = [
- "axum",
- "bincode",
- "blake3",
- "bytes",
- "clap",
- "common",
- "dashmap",
- "dotenv",
- "eyre",
- "futures",
- "hex",
- "libp2p",
- "libp2p-quic",
- "libp2p-stream",
- "mti",
- "opentelemetry_sdk",
- "peyk",
- "rand 0.10.2",
- "rs_merkle",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2824,6 +2791,39 @@ name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
+name = "portal"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bincode",
+ "blake3",
+ "bytes",
+ "clap",
+ "common",
+ "dashmap",
+ "dotenv",
+ "eyre",
+ "futures",
+ "hex",
+ "libp2p",
+ "libp2p-quic",
+ "libp2p-stream",
+ "mti",
+ "opentelemetry_sdk",
+ "peyk",
+ "rand 0.10.2",
+ "rs_merkle",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "potential_utf"
