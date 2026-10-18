@@ -1,7 +1,7 @@
 mod admission;
 mod bridge;
 mod blake3_wrapper;
-mod coordinator;
+mod pipeline;
 
 use std::{
     fs,
@@ -130,7 +130,7 @@ pub async fn run(
     let (tx_bridge, rx_bridge) = mpsc::channel::<admission::ToBridge>(128);
     let (mut swarm_jh, mut coord_jh, mut bridge_jh) = tokio::try_join!(
         peyk::process_swarm(swarm, rx_swarm, tx_handler, shutdown.clone()),
-        coordinator::run(rx_admission, rx_handler, tx_swarm, tx_bridge, blob_transfer_control, shutdown.clone()),
+        pipeline::run(rx_admission, rx_handler, tx_swarm, tx_bridge, blob_transfer_control, shutdown.clone()),
         bridge::run(rx_bridge, tx_admission, shutdown.clone())
     )?;
     tokio::select! {
@@ -149,10 +149,10 @@ pub async fn run(
             shutdown.cancel();
             match r {
                 Ok(_) => {
-                    info!("Coordinator task exited.");
+                    info!("Pipeline task exited.");
                     Ok(())
                 },
-                Err(e) => Err(eyre!("Coordinator task panicked: {e:?}"))
+                Err(e) => Err(eyre!("Pipeline task panicked: {e:?}"))
             }
         },
 
