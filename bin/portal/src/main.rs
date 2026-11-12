@@ -1,6 +1,5 @@
 use portal::Config;
 use std::env;
-// use opentelemetry_sdk::Resource;
 use tracing::info;
 use eyre::{
     Result,
@@ -12,15 +11,13 @@ use common::shutdown::wait_for_shutdown_signal;
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(tracing::Level::DEBUG)
         .init();
-    if let Err(e) = dotenv::dotenv() {
+    if let Err(e) = dotenvy::dotenv() {
         eprintln!("not loading .env file: {e}");
     }
     info!("Loading environment variables.");
     let cfg = Config {
-        grpc_addr: env::var("NODE_GRPC_ADDR")
-            .with_context(|| "`NODE_GRPC_ADDR` is missing")?,
         key_file: env::var("KEY_FILE").ok(),
         bootnode_peer_id: env::var("BOOTNODE_PEER_ID")
             .with_context(|| "`BOOTNODE_PEER_ID` is missing")?,
@@ -33,6 +30,8 @@ async fn main() -> Result<()> {
         external_port: env::var("EXTERNAL_PORT")
             .with_context(|| "`EXTERNAL_PORT` is missing")?,
         zone: env::var("ZONE").unwrap_or("ME".to_string()),
+        db_url: env::var("DATABASE_URL")
+            .with_context(|| "`DATABASE_URL` is missing")?,
     };
     let token = CancellationToken::new();
     tokio::spawn(wait_for_shutdown_signal(token.clone()));

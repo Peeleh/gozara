@@ -7,14 +7,10 @@ use eyre::Result;
 use tracing::{info, warn, debug};
 use tokio::{
     sync::{mpsc, Semaphore},
-    time::{Instant, timeout},
+    time::timeout,
     task,
 };
 use tokio_util::sync::CancellationToken;
-use dashmap::{
-    DashMap,
-    mapref::entry::Entry
-};
 use rs_merkle::MerkleTree;
 use blake3::Hash;
 use bytes::BytesMut;
@@ -26,54 +22,74 @@ use axum::{
     Router,
     response::{Response, IntoResponse}
 };
-use mti::prelude::MagicTypeId;
+use mti::prelude::{V7, MagicTypeId, MagicTypeIdExt};
 use std::str::FromStr;
+use sqlx::postgres::PgPool;
 use crate::blake3_wrapper::Blake3;
-use crate::admission::{Status, ToPipeline, ToBridge, AdmittedBlob, CHUNK_SIZE};
-use common::types::Timestamped;
+use crate::admission::{
+    BASE_BLOB_PATH, BlobStatus, ToPipeline, CHUNK_SIZE
+};
 
 // 1 GiB
-const MAX_BLOB_SIZE: usize = 1 << 30;
+const MAX_BLOB_SIZE: usize = 1<<30;
 
-// each permit = 4 MiB, in total we want 6 GiB worth of blob upload permits aka memory pressure
-const TOTAL_CHUNK_BUDGET: usize = 1536;
+// each permit = 4 MiB, in total 16 GiB worth of "upload permits/memory pressure"
+const TOTAL_CHUNK_BUDGET: usize = 1<<12;
 
 // max silence between frames
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn validate_id(id: &str) -> Result<String, StatusCode> {
-    let validated_id = MagicTypeId::from_str(&id)
-        .map_err(|e| {
-            debug!(error = %e, id = %id, "Bad Id.");
-            StatusCode::BAD_REQUEST
-        })?
-        .to_string();
-    Ok(validated_id)
+fn is_id_valid(
+    id: &str
+) -> bool {
+    MagicTypeId::from_str(&id).is_ok()
+}
+
+async fn fetch_status_from_db(
+    id: &str,
+    db_pool: &PgPool
+) -> Option<BlobStatus> {
+    match sqlx::query!(
+        r#"SELECT status AS "status: BlobStatus" from blobs WHERE id = $1"#,
+        id
+    )
+    .fetch_optional(db_pool)
+    .await
+    {
+        Ok(Some(row)) => Some(row.status),
+        Ok(None) => None,
+        Err(e) => {
+            warn!(blob = %id, error = %e, "Failed to fetch status from the DB.");
+            None
+        }
+    }
 }
 
 struct Admission {
-    map: Arc<DashMap<String, Vec<Timestamped<Status>>>>,
     id: String,
-    committed: bool
+    committed: bool,
+    db_pool: PgPool
 }
 
 impl Admission {
-    fn new(state: &BridgeState, id: String) -> Result<Self, StatusCode> {
-        let validated_id = validate_id(&id)?;
-        match state.status_map.entry(validated_id.clone()) {
-            Entry::Occupied(_) => Err(StatusCode::CONFLICT),
-            Entry::Vacant(e) => {
-                e.insert(vec![Timestamped::<Status> {
-                    value: Status::Pending,
-                    at: Instant::now(),
-                }]);
-                Ok(Self {
-                    map: state.status_map.clone(),
-                    id: validated_id,
-                    committed: false
-                })
-            }
+    async fn new(
+        id: &str,
+        db_pool: PgPool
+    ) -> Result<Self, StatusCode> {
+        if let Some(_) = fetch_status_from_db(id, &db_pool).await {
+            return Err(StatusCode::CONFLICT.into())
         }
+        let new_status = BlobStatus::Distributing;
+        let _ = sqlx::query!(
+            r#"INSERT INTO blobs(id, status) VALUES($1, $2)"#,
+            id,
+            new_status as BlobStatus
+        )
+        .execute(&db_pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok(Self { id: id.to_owned(), committed: false, db_pool })
     }
 
     fn commit(mut self) {
@@ -81,11 +97,16 @@ impl Admission {
     }
 }
 
-// remove the blob from the map if the upload is cancelled mid-journey
 impl Drop for Admission {
     fn drop(&mut self) {
         if !self.committed {
-            self.map.remove(&self.id);
+            // todo: remove the directory containing chunks
+            // if let Err(e) = sqlx::query!("DELETE FROM blobs WHERE id = $1", self.id.clone())
+            //     .execute(self.db_pool)
+            //     .await
+            // {
+            //     warn!(blob = %self.id, "Could not delete from the DB.");
+            // }
         }
     }
 }
@@ -111,17 +132,36 @@ impl IntoResponse for Reject {
 
 async fn hash_chunk(
     hashing: Arc<Semaphore>,
-    chunk: Bytes
-) -> Result<(Hash, Bytes), StatusCode> {
+    chunk: &Bytes
+) -> Result<Hash, StatusCode> {
     let permit = hashing.acquire_owned().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let c = chunk.clone();
     let hash = task::spawn_blocking(move || {
         let h = blake3::hash(&c);
         drop(permit);
         h
-    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok((hash, chunk))
+    Ok(hash)
+}
+
+async fn write_chunks_to_disk(
+    id: &str,
+    leaves: &[Hash],
+    chunks: &[Bytes])
+-> Result<()> {
+    use tokio::fs;
+    let blob_path = std::path::Path::new(BASE_BLOB_PATH).join(id);
+    fs::create_dir_all(&blob_path).await?;
+    let random_name = blob_path.join("tmp_".create_type_id::<V7>().as_str());
+    for (chunk_id, chunk) in leaves.iter().zip(chunks.iter()) {
+        fs::write(&random_name, chunk).await?;
+        let hex_id = chunk_id.to_hex().to_string();
+        fs::rename(&random_name, &blob_path.join(&hex_id)).await?;
+    }
+    Ok(())
 }
 
 
@@ -129,16 +169,19 @@ async fn hash_chunk(
 struct BridgeState {
     hashing: Arc<Semaphore>,
     admission_budget: Arc<Semaphore>,
-    status_map: Arc<DashMap<String, Vec<Timestamped<Status>>>>,
+    db_pool: PgPool,
     tx_admission: mpsc::Sender<ToPipeline>,
 }
 
 impl BridgeState {
-    fn new(tx_admission: mpsc::Sender<ToPipeline>) -> Self {
-        BridgeState {
+    fn new(
+        db_pool: PgPool,
+        tx_admission: mpsc::Sender<ToPipeline>
+    ) -> Self {
+        Self {
             hashing: Arc::new(Semaphore::new(2)),
             admission_budget: Arc::new(Semaphore::new(TOTAL_CHUNK_BUDGET)),
-            status_map: Arc::new(DashMap::new()),
+            db_pool,
             tx_admission
         }
     }
@@ -148,69 +191,76 @@ async fn get_status(
     State(state): State<BridgeState>,
     Path(id): Path<String>
 ) -> Result<(StatusCode, String), Reject> {
-    let validated_id = validate_id(&id)?;
-    match state.status_map.get(&validated_id) {
-        Some(status_list) => {
-            let most_recent_status = format!("{:?}", status_list.last().unwrap().value);
-            Ok((StatusCode::FOUND, most_recent_status))
+    if !is_id_valid(&id) {
+        debug!(id = %id, "Invalid Id.");
+        return Err(Reject(StatusCode::BAD_REQUEST))
+    }
+    if let Some(status) = fetch_status_from_db(&id, &state.db_pool).await {
+        match status {
+            BlobStatus::Gathering | BlobStatus::Distributing =>
+                Ok((StatusCode::ACCEPTED, format!("{status:?}"))),
+            BlobStatus::Finished => Ok((StatusCode::OK, format!("{status:?}"))),
+            BlobStatus::Failed => Err(StatusCode::BAD_GATEWAY.into())
         }
-        None => Err(Reject(StatusCode::NOT_FOUND))
+    } else {
+        Err(Reject(StatusCode::NOT_FOUND))
     }
 }
 
-// to assemble from remote nodes
-async fn get_blob(
+// to gather from remote nodes
+async fn gather_blob(
     State(state): State<BridgeState>,
     Path(id): Path<String>,
-) -> Result<(StatusCode, String), Reject> {
-    let validated_id = validate_id(&id)?;
-    let mut notify = false;
-    let status = match state.status_map.entry(validated_id.clone()) {
-        Entry::Occupied(e) => {
-            e.get().last().unwrap().value.clone()
-        },
-        Entry::Vacant(e) => {
-            e.insert(vec![Timestamped::<Status> {
-                value: Status::Pending,
-                at: Instant::now()
-            }]);
-            notify = true;
-            Status::Pending
+) -> Result<StatusCode, Reject> {
+    if !is_id_valid(&id) {
+        debug!(id = %id, "Invalid Id.");
+        return Err(Reject(StatusCode::BAD_REQUEST))
+    }
+    match fetch_status_from_db(&id, &state.db_pool).await {
+        Some(s) => match s {
+            BlobStatus::Gathering => Ok(StatusCode::ACCEPTED),
+            BlobStatus::Distributing => Err(StatusCode::CONFLICT.into()),
+            BlobStatus::Finished => Ok(StatusCode::OK),
+            BlobStatus::Failed => Err(StatusCode::BAD_GATEWAY.into())
         }
-    };
-
-    match status {
-        Status::Pending => {
-            if notify {
-                state.tx_admission
-                    .send(ToPipeline::GetBlob { id: validated_id.clone() })
-                    .await
-                    .map_err(|e| {
-                        debug!(error = %e, "Failed to notify the coordinator about a missing blob.");
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?;
-            }
-            Ok((StatusCode::ACCEPTED, validated_id))
-        }
-        Status::Finalized => {
-            // todo: gather blob info
-            Ok((StatusCode::OK, validated_id))
-        }
-        Status::Failed { reason } => {
-            // todo: failed blobs should be evicted from the status map after a while to allow retry
-            Ok((StatusCode::BAD_GATEWAY, reason.unwrap_or_default()))
+        None => {
+            // register blob on the db
+            let new_status = BlobStatus::Gathering;
+            let _ = sqlx::query!(
+                r#"INSERT INTO blobs(id, status) VALUES($1, $2)"#,
+                id.clone(),
+                new_status as BlobStatus
+            )
+            .execute(&state.db_pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            // notify the pipeline
+            state
+                .tx_admission
+                .send(ToPipeline::GatherBlob(id.clone()))
+                .await
+                .map_err(|e| {
+                    debug!(blob = %id, error = %e,
+                        "Failed to notify the pipeline about a new gather."
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            Ok(StatusCode::ACCEPTED)
         }
     }
 }
 
 // to distribute
-async fn new_blob(
+async fn distribute_blob(
     State(state): State<BridgeState>,
     Path(id): Path<String>,
     headers: header::HeaderMap,
     body: Body
-) -> Result<(StatusCode, String), Reject> {
-    let validated_id = validate_id(&id)?;
+) -> Result<StatusCode, Reject> {
+    if !is_id_valid(&id) {
+        debug!(id = %id, "Invalid Id.");
+        return Err(Reject(StatusCode::BAD_REQUEST))
+    }
     // check for blob size first and whether we have enough budget to admit it
     let declared_blob_len: usize = headers.get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok()?.parse().ok())
@@ -219,17 +269,18 @@ async fn new_blob(
         return Err(StatusCode::BAD_REQUEST.into())
     }
     let num_chunks = declared_blob_len.div_ceil(CHUNK_SIZE);
-    if declared_blob_len > MAX_BLOB_SIZE || num_chunks > TOTAL_CHUNK_BUDGET {
+    if declared_blob_len > MAX_BLOB_SIZE {
         return Err(StatusCode::PAYLOAD_TOO_LARGE.into())
     }
-    let admission = Admission::new(&state, validated_id.clone())?;
-    let allowance = state.admission_budget.clone()
+    let admission_permit = state.admission_budget.clone()
         .try_acquire_many_owned(num_chunks as u32)
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let admission = Admission::new(&id, state.db_pool.clone()).await?;
     // stream in chunks
     let mut stream = body.into_data_stream();
     let mut buf = BytesMut::with_capacity(CHUNK_SIZE);
     let mut chunks = Vec::with_capacity(num_chunks);
+    let mut leaves = Vec::with_capacity(num_chunks);
     let mut received = 0usize;
     while let Some(frame) = timeout(BODY_IDLE_TIMEOUT, stream.next())
         .await
@@ -245,7 +296,8 @@ async fn new_blob(
             buf.extend_from_slice(&data.split_to(take));
             if buf.len() == CHUNK_SIZE {
                 let full = std::mem::replace(&mut buf, BytesMut::with_capacity(CHUNK_SIZE)).freeze();
-                chunks.push(hash_chunk(state.hashing.clone(), full).await?);
+                leaves.push(hash_chunk(state.hashing.clone(), &full).await?);
+                chunks.push(full);
             }
         }
     }
@@ -253,46 +305,50 @@ async fn new_blob(
         return Err(StatusCode::BAD_REQUEST.into())
     }
     if !buf.is_empty() {
-        chunks.push(hash_chunk(state.hashing.clone(), buf.freeze()).await?);
+        let last_chunk = buf.freeze();
+        leaves.push(hash_chunk(state.hashing.clone(), &last_chunk).await?);
+        chunks.push(last_chunk);
     }
     // merklize it
-    let leaves: Vec<[u8; 32]> = chunks.iter().map(|(h, _)| *h.as_bytes()).collect();
-    let merkle_tree = MerkleTree::<Blake3>::from_leaves(leaves.as_slice());
+    let merkle_tree = {
+        let simple_leaves: Vec<[u8; 32]> = leaves.iter().map(|h| *h.as_bytes()).collect();
+        MerkleTree::<Blake3>::from_leaves(&simple_leaves)
+    };
     let root_hash: Hash = merkle_tree.root()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
         .into();
-    let root_hash_str = root_hash.to_hex().to_string();
+    // dump chunks to the disk
+    write_chunks_to_disk(&id, &leaves, &chunks)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     state.tx_admission
-        .send(ToPipeline::NewBlob(AdmittedBlob {
-            id: validated_id.clone(),
-            root_hash, merkle_leaves: leaves, merkle_tree,
-            chunks, allowance
-        }))
+        .send(ToPipeline::DistributeBlob {
+            id: id.clone(), root_hash, merkle_leaves: leaves, admission_permit
+        })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     admission.commit();
-    info!("Admitted a new blob with id(`{id}`), root hash(`{root_hash_str}`), #chunks(`{num_chunks}`), and total size of `{:.1}` MiB",
-        declared_blob_len as f32 / 1_048_576f32
+    info!(id = %id, num_chunks = %num_chunks, size = declared_blob_len as f32 / 1_048_576f32,
+        "Admitted a new blob."
     );
-    Ok((StatusCode::CREATED, validated_id))
+    Ok(StatusCode::CREATED)
 }
 
 pub async fn run(
-    mut rx_bridge: mpsc::Receiver<ToBridge>,
+    db_pool: PgPool,
     tx_admission: mpsc::Sender<ToPipeline>,
     shutdown: CancellationToken
 ) -> Result<task::JoinHandle<()>> {
-    let state = BridgeState::new(tx_admission);
-    let state_server = state.clone();
+    let state = BridgeState::new(db_pool, tx_admission);
     let shutdown_bridge = shutdown.clone();
     let app = Router::new()
         .route("/status/{id}", get(get_status))
-        .route("/blob/{id}", get(get_blob).post(new_blob))
-        .with_state(state_server);
+        .route("/blob/{id}", get(gather_blob).post(distribute_blob))
+        .with_state(state);
     const ADDR: &str = "127.0.0.1:8709";
     let listener = tokio::net::TcpListener::bind(ADDR).await?;
-    let mut server_jh = tokio::spawn(async move {
-        info!("Artifact store HTTP bridge is up and listening on `{ADDR}`.");
+    let server_jh = tokio::spawn(async move {
+        info!("The HTTP bridge is up and listening on port `{ADDR}`.");
         if let Err(e) = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_bridge.cancelled_owned())
             .await
@@ -300,62 +356,8 @@ pub async fn run(
             warn!("Failed to serve the HTTP bridge: {e:?}");
         }
     });
-    let shutdown_msg = shutdown.clone();
-    let mut msg_jh = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown_msg.cancelled() => {
-                    info!("Received shutdown request.");
-                    break
-                },
-
-                m = rx_bridge.recv() => match m {
-                    Some(b_msg) => {
-                        match b_msg {
-                            ToBridge::UpdateStatus {
-                                id,
-                                status
-                            } => {
-                                match state.status_map.entry(id.clone()) {
-                                    Entry::Occupied(mut entry) => {
-                                        entry.get_mut().push(
-                                            Timestamped::<Status> { value: status, at: Instant::now() }
-                                        );
-                                    }
-                                    Entry::Vacant(_) => {
-                                        warn!(
-                                            "Unsolicited status update(`{:?}`) for blob(`{}`).",
-                                            status,
-                                            id
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        warn!("Bridge message channel is closed.");
-                        break
-                    }
-                }
-            }
-        }
+    tokio::spawn(async move {
+        let _ = shutdown.cancelled().await;
     });
-    Ok(tokio::spawn(async move {
-        tokio::select! {
-            r = &mut server_jh => {
-                shutdown.cancel();
-                if let Err(e) = r {
-                    warn!("The Axum server task panicked: {e:?}");
-                }
-            },
-
-            r = &mut msg_jh => {
-                shutdown.cancel();
-                if let Err(e) = r {
-                    warn!("The bridge channel task panicked: {e:?}");
-                }
-            },
-        }
-    }))
+    Ok(server_jh)
 }

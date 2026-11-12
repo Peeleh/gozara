@@ -2,10 +2,9 @@ mod admission;
 mod bridge;
 mod blake3_wrapper;
 mod pipeline;
+mod blob;
 
-use std::{
-    fs,
-};
+use std::fs;
 use eyre::{eyre, Result};
 use tracing::{info, warn};
 use libp2p::{
@@ -16,16 +15,18 @@ use libp2p::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use libp2p::swarm::Swarm;
+use sqlx::postgres::PgPoolOptions;
+use std::time::Duration;
 
 pub struct Config {
-    pub grpc_addr: String,
     pub key_file: Option<String>,
     pub bootnode_peer_id: String,
     pub bootnode_ip_addr: String,
-    pub bootnode_port: String, 
+    pub bootnode_port: String,
     pub external_ip_addr: String,
     pub external_port: String,
     pub zone: String,
+    pub db_url: String
 }
 
 fn go_public(config: Config) -> Result<Swarm<peyk::p2p::GlobalBehaviour>> {
@@ -43,11 +44,11 @@ fn go_public(config: Config) -> Result<Swarm<peyk::p2p::GlobalBehaviour>> {
             new_key
         }
     };
-    let my_peer_id = PeerId::from_public_key(&local_key.public());    
+    let my_peer_id = PeerId::from_public_key(&local_key.public());
     info!(
         "My peer id: `{}`",
         my_peer_id
-    );  
+    );
     let mut swarm = peyk::p2p::setup_global_swarm(&local_key)?;
     // listen on all interfaces
     // ipv4
@@ -71,8 +72,8 @@ fn go_public(config: Config) -> Result<Swarm<peyk::p2p::GlobalBehaviour>> {
         .behaviour_mut()
         .gossipsub
         .subscribe(&topic);
-    
-    // init kademlia: get to know bootnode(s)    
+
+    // init kademlia: get to know bootnode(s)
     swarm.behaviour_mut()
         .kademlia
         .add_address(
@@ -85,7 +86,7 @@ fn go_public(config: Config) -> Result<Swarm<peyk::p2p::GlobalBehaviour>> {
         );
     // initiate bootstrapping
     match swarm.behaviour_mut().kademlia.bootstrap() {
-        Ok(query_id) => {            
+        Ok(query_id) => {
             info!(
                 "Bootstrap is initiated, query id: {:?}",
                 query_id
@@ -98,7 +99,7 @@ fn go_public(config: Config) -> Result<Swarm<peyk::p2p::GlobalBehaviour>> {
             );
         }
     };
-    // specify the external address    
+    // specify the external address
     swarm.add_external_address(
         format!(
             "/ip4/{}/tcp/{}",
@@ -122,16 +123,32 @@ pub async fn run(
     config: Config,
     shutdown: CancellationToken
 ) -> Result<()> {
+    // db
+    // sqlx::migrate!("./migrations").run(pool).await?;
+    let db_pool = PgPoolOptions::new()
+        .max_connections(50)
+        .acquire_timeout(Duration::from_secs(3))
+        .idle_timeout(Duration::from_secs(10))
+        .connect(&config.db_url)
+        .await?;
+    // networking
     let swarm = go_public(config)?;
     let blob_transfer_control = swarm.behaviour().blob_stream.new_control();
     let (tx_swarm, rx_swarm) = mpsc::channel::<peyk::ToSwarm>(16);
-    let (tx_handler, rx_handler) = mpsc::channel::<peyk::HandlerMessage>(256);
+    let (tx_handler, rx_handler) = mpsc::channel::<peyk::FromSwarm>(256);
     let (tx_admission, rx_admission) = mpsc::channel::<admission::ToPipeline>(16);
-    let (tx_bridge, rx_bridge) = mpsc::channel::<admission::ToBridge>(128);
-    let (mut swarm_jh, mut coord_jh, mut bridge_jh) = tokio::try_join!(
+
+    let (mut swarm_jh, mut pipeline_jh, mut bridge_jh) = tokio::try_join!(
         peyk::process_swarm(swarm, rx_swarm, tx_handler, shutdown.clone()),
-        pipeline::run(rx_admission, rx_handler, tx_swarm, tx_bridge, blob_transfer_control, shutdown.clone()),
-        bridge::run(rx_bridge, tx_admission, shutdown.clone())
+        pipeline::run(
+            db_pool.clone(),
+            rx_admission,
+            rx_handler,
+            tx_swarm,
+            blob_transfer_control,
+            shutdown.clone()
+        ),
+        bridge::run(db_pool, tx_admission, shutdown.clone())
     )?;
     tokio::select! {
         r = &mut swarm_jh => {
@@ -145,7 +162,7 @@ pub async fn run(
             }
         },
 
-        r = &mut coord_jh => {
+        r = &mut pipeline_jh => {
             shutdown.cancel();
             match r {
                 Ok(_) => {

@@ -1,13 +1,13 @@
 use std::time::Duration;
 use libp2p::{
-    core::{        
+    core::{
         muxing::StreamMuxerBox,
         transport::Boxed
     },
     tcp,
     yamux,
     noise,
-    Transport,    
+    Transport,
     gossipsub,
     identity,
     identify,
@@ -44,11 +44,11 @@ fn prepare_gossipsub_behaviour(
 
 // prepare request-response behaviour
 fn prepare_request_response_behaviour()
--> request_response::cbor::Behaviour<protocol::Request, protocol::Response> 
+-> request_response::cbor::Behaviour<protocol::Request, protocol::Response>
 {
     request_response::cbor::Behaviour::<protocol::Request, protocol::Response>::new(
         [(
-            StreamProtocol::new("/gozara/req_resp/1.0"),
+            StreamProtocol::new("/gozara/req-resp/1.0.0/"),
             request_response::ProtocolSupport::Full,
         )],
         request_response::Config::default(),
@@ -61,7 +61,7 @@ pub fn prepare_identify_behaviour(
 )-> identify::Behaviour {
     identify::Behaviour::new(
         identify::Config::new(
-            String::from("/gozara/identify/1.0"),
+            String::from("/gozara/identify/1.0.0/"),
             public_key.clone()
         )
     )
@@ -69,7 +69,7 @@ pub fn prepare_identify_behaviour(
 
 fn _prepare_quic_transport(
     keypair: &identity::Keypair
-) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {    
+) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
     Ok(
         quic::tokio::Transport::new(quic::Config::new(keypair))
             .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
@@ -78,7 +78,7 @@ fn _prepare_quic_transport(
     )
 }
 
-// main network behaviour 
+// main network behaviour
 #[derive(NetworkBehaviour)]
 pub struct GlobalBehaviour {
     pub identify: identify::Behaviour,
@@ -92,15 +92,15 @@ pub fn prepare_kademlia_behaviour(
     public_key: &identity::PublicKey,
 ) -> kad::Behaviour<MemoryStore> {
     let mut cfg = kad::Config::new(
-        StreamProtocol::new("/gozara/kad/1.0")
+        StreamProtocol::new("/gozara/kad/1.0.0/")
     );
-    cfg.set_query_timeout(Duration::from_secs(5 * 60));    
+    cfg.set_query_timeout(Duration::from_secs(5 * 60));
     let local_peer_id = PeerId::from(public_key.clone());
     let store = MemoryStore::new(local_peer_id);
     kad::Behaviour::with_config(local_peer_id, store, cfg)
 }
 
-// setup a global swram instance
+// setup a global swarm instance
 pub fn setup_global_swarm(
     keypair: &identity::Keypair,
 )-> Result<Swarm<GlobalBehaviour>> {
@@ -114,7 +114,7 @@ pub fn setup_global_swarm(
         )?
         .with_quic()
         .with_dns()?
-        .with_behaviour(|key| {            
+        .with_behaviour(|key| {
             let public_key = key.public();
             Ok(GlobalBehaviour {
                 identify: prepare_identify_behaviour(&public_key),
@@ -125,6 +125,6 @@ pub fn setup_global_swarm(
             })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-        .build();    
+        .build();
     Ok(swarm)
 }

@@ -1,40 +1,27 @@
-use serde::Serialize;
-use rs_merkle::MerkleTree;
 use blake3::Hash;
-use bytes::Bytes;
 use tokio::sync::OwnedSemaphorePermit;
-use crate::blake3_wrapper::Blake3;
 
 // 4 MiB
-pub const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+pub const CHUNK_SIZE: usize = 1<<22;
+// blob storage path on disk
+pub const BASE_BLOB_PATH: &str = "./blobs";
 
-#[derive(Clone, Serialize, Debug)]
-#[serde(tag = "status", rename_all = "lowercase")]
-pub enum Status {
-    Pending,
-    Finalized,
-    Failed { reason: Option<String> },
-}
-
-pub struct AdmittedBlob {
-    pub id: String,
-    pub root_hash: Hash,
-    pub merkle_leaves: Vec<[u8; 32]>,
-    pub merkle_tree: MerkleTree<Blake3>,
-    pub chunks: Vec<(Hash, Bytes)>,
-    pub allowance: OwnedSemaphorePermit,
+#[derive(sqlx::Type, Debug, Clone)]
+#[sqlx(type_name = "status", rename_all = "lowercase")]
+pub enum BlobStatus {
+    Gathering,
+    Distributing,
+    Finished,
+    Failed,
 }
 
 pub enum ToPipeline {
-    GetBlob {
+    // <id>
+    GatherBlob(String),
+    DistributeBlob {
         id: String,
-    },
-    NewBlob(AdmittedBlob)
-}
-
-pub enum ToBridge {
-    UpdateStatus {
-        id: String,
-        status: Status
+        root_hash: Hash,
+        merkle_leaves: Vec<Hash>,
+        admission_permit: OwnedSemaphorePermit,
     }
 }

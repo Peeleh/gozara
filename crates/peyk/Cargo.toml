@@ -21,6 +21,7 @@ eyre.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
+tempfile.workspace = true
 tracing.workspace = true
 bincode.workspace = true
 bytes.workspace = true

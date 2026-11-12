@@ -28,7 +28,7 @@ pub struct BootNodeBehaviour {
     pub kademlia: kad::Behaviour<MemoryStore>,
 }
 
-// setup a bootnode-specific swram instance
+// setup a bootnode-specific swarm instance
 pub fn setup_swarm_for_bootnode(
     keypair: &identity::Keypair,
 )-> Result<Swarm<BootNodeBehaviour>> {

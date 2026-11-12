@@ -35,7 +35,7 @@ config = "0.14.0"
 dashmap = "6.1.0"
 #deadpool-redis = "0.22.0"
 dirs = "6.0.0"
-dotenv = "0.15.0"
+dotenvy = "0.15.0"
 eyre = "0.6.12"
 #flate2 = "1.1.4"
 futures = "0.3.31"
@@ -59,7 +59,7 @@ rand = "0.10.2"
 #rustls = { version = "0.23.27", features = ["ring"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
-#sqlx = { version = "0.8.5", features = ["runtime-tokio", "tls-native-tls", "macros", "postgres", "time"] }
+sqlx = { version = "0.8.5", features = ["runtime-tokio", "macros", "postgres", "time"] }
 # sys-info = "0.9.1"
 # sysinfo = "0.33.1"
 # tar = "0.4.44"
@@ -68,7 +68,7 @@ time = { version = "0.3.41", features = ["serde"] }
 tokio = { version = "1.45.0", features = ["full", "tracing", "rt-multi-thread"] }
 tokio-blocked = "0.1.0"
 tokio-stream = "0.1"
-tokio-util = { version = "0.7.18", features =["io"] }
+tokio-util = { version = "0.7.18", features =["io", "compat"] }
 # tonic = { version = "0.12.3", features = ["tls"] }
 # tonic-build = "0.12.3"
 #tonic-web = "0.12.3"
@@ -83,6 +83,7 @@ libp2p-quic = { version = "0.14", features = ["tokio"] }
 libp2p-stream = "0.5.0-alpha"
 blake3 = "1.8.7"
 rs_merkle = "1.5.0"
+tempfile = "3.27.0"
 
 
 
