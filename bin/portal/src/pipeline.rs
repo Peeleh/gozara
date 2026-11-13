@@ -456,12 +456,22 @@ impl Pipeline {
                     );
                     return
                 }
-                let Ok(_permit) = self.download_permit.clone().try_acquire_owned() else {
-                    debug!(chunk = %id, from = %peer, "Could not acquire a download permit.");
-                    // todo: retry mechanism
+                let Some(permit) = self
+                    .download_permit
+                    .clone()
+                    .try_acquire_owned()
+                    .ok()
+                else {
+                    debug!(chunk = %id, from = %peer,
+                        "Not enough download permit for the pull chunk ACK."
+                    );
                     return
                 };
-                *context = Some(PullContext { from: peer, created_at: Instant::now(), _permit });
+                *context = Some(PullContext {
+                    from: peer,
+                    permit: Some(permit),
+                    created_at: Instant::now()
+                });
             }
             RemoteChunk::Failed => {
                 // todo
@@ -679,15 +689,18 @@ impl Pipeline {
         };
         match in_push {
             blob_transfer::IncomingPush::Request { peer, hash, len, reply_tx } => {
-                let chunk_path = chunks
-                    .get(&hash)
+                let pull_permit = chunks
+                    .get_mut(&hash)
                     .and_then(|chunk| match chunk {
                         RemoteChunk::Pulling { context, .. } => {
                             context
-                                .as_ref()
+                                .as_mut()
                                 .and_then(|pull_context|
                                     if pull_context.from == peer {
-                                        Some(path.as_path().join(hash.to_string()))
+                                        Some(blob_transfer::IOPermit {
+                                            path: path.as_path().join(hash.to_string()),
+                                            permit: pull_context.permit.take().unwrap()
+                                        })
                                     } else {
                                         None
                                     }
@@ -695,12 +708,12 @@ impl Pipeline {
                         }
                         _ => None
                     });
-                    if chunk_path.is_none() {
-                        debug!(hash = %hash.to_hex(), from = %peer, len = %len,
-                            "Unsolicited incoming push."
-                        );
-                    }
-                    let _ = reply_tx.send(chunk_path);
+                if pull_permit.is_none() {
+                    debug!(hash = %hash.to_hex(), from = %peer, len = %len,
+                        "Unsolicited incoming push."
+                    );
+                };
+                let _ = reply_tx.send(pull_permit);
             }
             blob_transfer::IncomingPush::Finished { hash, succeeded } => {
                 let Some(chunk) = chunks.get_mut(&hash) else {
@@ -745,7 +758,7 @@ impl Pipeline {
                 .ok()
                 .map(|permit| {
                     let chunk_path = path.as_path().join(&in_pull.hash.to_string());
-                    blob_transfer::PullPermit { path: chunk_path, _permit: permit }
+                    blob_transfer::IOPermit { path: chunk_path, permit }
                 })
         } else {
             debug!(hash = %in_pull.hash.to_hex(), from = %in_pull.peer,

@@ -290,34 +290,36 @@ pub async fn pull(
 }
 
 #[derive(Debug)]
+#[allow(unused)]
+pub struct IOPermit {
+    pub path: PathBuf,
+    pub permit: OwnedSemaphorePermit
+}
+
+#[derive(Debug)]
 pub enum IncomingPush {
     Request {
         peer: PeerId,
         hash: Hash,
         len: usize,
-        reply_tx: oneshot::Sender<Option<PathBuf>>
+        reply_tx: oneshot::Sender<Option<IOPermit>>
     },
-    Finished{
+    Finished {
         hash: Hash,
         succeeded: bool
     }
 }
 
-#[derive(Debug)]
-pub struct PullPermit {
-    pub path: PathBuf,
-    pub _permit: OwnedSemaphorePermit
-}
 
 #[derive(Debug)]
 pub struct IncomingPull {
     pub peer: PeerId,
     pub hash: Hash,
-    reply_tx: oneshot::Sender<Option<PullPermit>>,
+    reply_tx: oneshot::Sender<Option<IOPermit>>,
 }
 
 impl IncomingPull {
-    pub fn reply(self, pull_permit: Option<PullPermit>) {
+    pub fn reply(self, pull_permit: Option<IOPermit>) {
         let _ = self.reply_tx.send(pull_permit);
     }
 }
@@ -335,15 +337,15 @@ async fn handle_incoming_push(
         let _ = write_rejection(&mut stream, "receiver is not available").await;
         return Err(eyre!("failed to notify the pipeline about an incoming push"));
     }
-    let Some(path) = rx.await.ok().flatten() else {
+    let Some(push_permit) = rx.await.ok().flatten() else {
         let _ = write_rejection(&mut stream, "push refused").await;
         return Err(eyre!("push refused"));
     };
-    let Some(dir) = path.parent() else {
+    let Some(dir) = push_permit.path.parent() else {
         let reason = format!("interal error");
         let _ = write_rejection(&mut stream, &reason).await;
         let _ = tx.send(IncomingPush::Finished { hash: expected, succeeded: false }).await;
-        return Err(eyre!("no parent for {}", path.display()));
+        return Err(eyre!("no parent for {}", push_permit.path.display()));
     };
     let (actual, temp_path) = receive_to_temp(&mut stream, len, dir).await?;
     if actual != expected {
@@ -355,7 +357,7 @@ async fn handle_incoming_push(
         ));
     }
 
-    persist(temp_path, &path)?;
+    persist(temp_path, &push_permit.path)?;
 
     stream.write_all(&[TAG_YES]).await?;
     finish(&mut stream, peer, Direction::Push).await;

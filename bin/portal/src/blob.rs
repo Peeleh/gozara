@@ -17,8 +17,8 @@ use peyk::protocol::Manifest;
 #[derive(Debug)]
 pub struct PullContext {
     pub from: PeerId,
-    pub created_at: Instant,
-    pub _permit: OwnedSemaphorePermit
+    pub permit: Option<OwnedSemaphorePermit>,
+    pub created_at: Instant
 }
 
 #[derive(Debug)]

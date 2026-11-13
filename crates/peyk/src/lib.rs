@@ -281,7 +281,9 @@ pub async fn process_swarm(
                         if let Err(e) = tx_handler.try_send(FromSwarm::PublishManifestResult {
                             blob_id: id.to_owned(), query_id, succeeded
                         }) {
-                            debug!("Failed to notify the publish manifest result.");
+                            debug!(blob = id, error = %e,
+                                "Failed to notify the publish manifest result."
+                            );
                         }
                     }
                     // get record
