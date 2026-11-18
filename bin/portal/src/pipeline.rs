@@ -20,7 +20,7 @@ use crate::admission::{
     BASE_BLOB_PATH, ToPipeline, CHUNK_SIZE
 };
 use crate::blob::{
-    LocalBlob, LocalChunk, PushContext, RemoteBlob, RemoteChunk, InflightPull
+    LocalBlob, LocalChunk, InflightPush, RemoteBlob, RemoteChunk, InflightPull
 };
 use peyk::{
     blob_transfer,
@@ -110,8 +110,8 @@ impl Pipeline {
             warn!("Another local blob is already being pushed.");
             return
         }
-        let path = Path::new(BASE_BLOB_PATH).join(&id);
-        if let Err(e) = tokio::fs::create_dir_all(&path).await {
+        let base_path = Path::new(BASE_BLOB_PATH).join(&id);
+        if let Err(e) = tokio::fs::create_dir_all(&base_path).await {
             warn!(blob = %id, error = %e, "Failed to create the local blob folder.");
             return
         }
@@ -122,7 +122,7 @@ impl Pipeline {
         self.local_blob = Some((
             id,
             LocalBlob::Distributing {
-                root_hash, merkle_leaves, chunks, path, _admission_permit
+                root_hash, merkle_leaves, chunks, base_path, _admission_permit
             }
         ));
         self.assign_chunks().await;
@@ -229,7 +229,9 @@ impl Pipeline {
             // nothing to be done
             return
         }
-        let Some((_id, LocalBlob::Distributing { chunks, path, .. })) = &mut self.local_blob else {
+        let Some((_id, LocalBlob::Distributing { chunks, base_path, .. })) =
+            self.local_blob.as_mut()
+        else {
             return
         };
         let now = Instant::now();
@@ -245,20 +247,20 @@ impl Pipeline {
         }
         let is_eligible = |lc: &LocalChunk, peers: &[PeerId]| match lc {
             LocalChunk::AwaitingAssignment => true,
-            LocalChunk::Assigned { context, failed, .. }  => {
-                context.is_none() &&
-                peers.iter().any(|peer| match failed.get(peer) {
-                    Some(attempts) => {
-                        attempts.len() < MAX_RETRIES
-                        && now.duration_since(*attempts.first().unwrap()).as_secs()
-                            < CHUNK_STALE_DEADLINE
-                    }
-                    None => true,
-                })
+            LocalChunk::Assigned { inflight, failed, .. }  => {
+                let has_timed_out = if let Some(InflightPush { created_at, .. }) = inflight {
+                    now.duration_since(*created_at).as_secs() > TIMEOUT_WINDOW
+                } else {
+                    true
+                };
+                has_timed_out
+                && peers
+                    .iter()
+                    .any(|peer| failed.get(peer).copied().unwrap_or_default() < MAX_RETRIES)
             },
             _ => false
         };
-        for (&hash, chunk) in chunks
+        for (hash, chunk) in chunks
             .iter_mut()
             .filter(|(_, c)| is_eligible(c, &peers))
             .take(num_available_permits)
@@ -267,46 +269,55 @@ impl Pipeline {
             eligible_peers.retain(|peer| match chunk {
                 LocalChunk::AwaitingAssignment => true,
                 LocalChunk::Assigned { failed, .. } => {
-                    if let Some(attempts) = failed.get(peer) {
-                        let first_try = *attempts.first().unwrap();
-                        attempts.len() < MAX_RETRIES
-                        && now.duration_since(first_try).as_secs() < CHUNK_STALE_DEADLINE
-                    } else {
-                        true
-                    }
+                    *failed.entry(*peer).or_default() < MAX_RETRIES
                 }
                 _ => false
             });
             // todo: peer selection strategy(fastest, most reliable, ...)
-            let peer = {
+            let chosen_peer = {
                 let mut rng = rand::rng();
                 use rand::seq::IndexedRandom;
                 let Some(peer) = eligible_peers.choose(&mut rng) else {
+                    warn!("Could not choose a peer: IndexedRandom misbehaved.");
                     continue
                 };
                 *peer
             };
             let hash_str = hash.to_string();
-            let Ok(permit) = self.upload_permit.clone().try_acquire_owned() else {
-                warn!(to = %peer, hash = %hash_str,
+            let Ok(permit) = self
+                .upload_permit
+                .clone()
+                .try_acquire_owned()
+            else {
+                debug!(to = %chosen_peer, hash = %hash_str,
                     "Could not get an upload permit for transfer."
                 );
                 break
             };
             let now = Instant::now();
-            let failed: HashMap<PeerId, Vec<Instant>> = match chunk {
-                LocalChunk::AwaitingAssignment => HashMap::new(),
-                LocalChunk::Assigned { failed, .. } => failed.clone(),
+            let (path, failed) = match chunk {
+                LocalChunk::AwaitingAssignment => (
+                    base_path.as_path().join(&hash_str),
+                    HashMap::new()
+                ),
+                LocalChunk::Assigned { path, failed, .. } => (path.clone(), failed.clone()),
                 _ => continue
             };
-            let context = Some(PushContext { to: peer, created_at: now });
-            *chunk = LocalChunk::Assigned { context, failed };
+            let inflight = Some(InflightPush {
+                to: chosen_peer,
+                created_at: now
+            });
+            *chunk = LocalChunk::Assigned {
+                path: path.clone(),
+                inflight,
+                failed
+            };
             // push it
-            debug!(chunk = %hash_str, to = %peer, "Chunk push is initiated.");
+            debug!(chunk = %hash_str, to = %chosen_peer, "Chunk push is initiated.");
             let _ = blob_transfer::push(
                 self.blob_transfer_control.clone(),
-                peer,
-                hash,
+                chosen_peer,
+                *hash,
                 path.as_path().join(&hash_str),
                 permit,
                 self.tx_transfer_outcome.clone(),
@@ -328,7 +339,6 @@ impl Pipeline {
             debug!(expected = %remote_id, given = %id, "Blob manifest Ids mismatch.");
             return
         }
-        let now = Instant::now();
         match remote_blob {
             RemoteBlob::AwaitingManifest(_) => {
                 // todo: validate root hash
@@ -403,11 +413,11 @@ impl Pipeline {
             LocalBlob::Distributing { chunks, .. } => {
                 for (_, chunk) in chunks.iter_mut() {
                     match chunk {
-                        LocalChunk::Assigned { context, failed, .. } => {
-                            if let Some(PushContext { to, created_at }) = context {
+                        LocalChunk::Assigned { inflight, failed, .. } => {
+                            if let Some(InflightPush { to, created_at }) = inflight {
                                 if now.duration_since(*created_at).as_secs() > TIMEOUT_WINDOW {
-                                    failed.entry(*to).or_default().push(now);
-                                    *context = None;
+                                    *failed.entry(*to).or_default() += 1;
+                                    *inflight = None;
                                 }
                             }
                         }
@@ -665,31 +675,28 @@ impl Pipeline {
         reply_tx: oneshot::Sender<Option<TransferPermit>>
     ) {
         debug!(hash = %hash.to_hex(), from = %from, "A new incoming pull request.");
-        let Some((_id, LocalBlob::Distributing { chunks, path, .. })) =
+        let Some((_id, LocalBlob::Distributing { chunks, .. })) =
             self.local_blob.as_mut()
         else {
             let _ = reply_tx.send(None);
             debug!("Local blob is not distributing.");
             return
         };
-        let Some(LocalChunk::Assigned { context, failed }) = chunks.get_mut(&hash) else {
+        let Some(LocalChunk::Assigned { path, inflight, failed, .. }) = chunks.get_mut(&hash) else {
             let _ = reply_tx.send(None);
             debug!("Chunk is not assigned or is missing.");
             return
         };
-        if context.is_some() {
+        if inflight.is_some() {
             let _ = reply_tx.send(None);
             debug!("Another pull is already underway.");
             return
         }
-        if let Some(attempts) = failed.get(&from) {
-            if attempts.len() >= MAX_RETRIES {
-                debug!("Max push retries already attempted for this peer.");
-                let _ = reply_tx.send(None);
-                return
-            }
+        if failed.get(&from).copied().unwrap_or_default() >= MAX_RETRIES {
+            debug!("Max push retries already attempted for this peer.");
+            let _ = reply_tx.send(None);
+            return
         }
-
         let Ok(permit) = self
             .upload_permit
             .clone()
@@ -699,13 +706,13 @@ impl Pipeline {
             let _ = reply_tx.send(None);
             return
         };
-        *context = Some(PushContext {
+        *inflight = Some(InflightPush {
             to: from,
             created_at: Instant::now()
         });
         let _ = reply_tx.send(Some(
             TransferPermit {
-                path: path.as_path().join(&hash.to_string()),
+                path: path.clone(),
                 permit
             }
         ));
@@ -732,12 +739,12 @@ impl Pipeline {
             debug!("Unsolicited chunk.");
             return
         };
-        let LocalChunk::Assigned { context, failed } = chunk else {
+        let LocalChunk::Assigned { inflight, failed, .. } = chunk else {
             debug!("Not pushing.");
             return
         };
-        let Some(PushContext { to, .. }) = context else {
-            debug!("No push context.");
+        let Some(InflightPush { to, .. }) = inflight else {
+            debug!("No active inflight push.");
             // todo: late success
             return
         };
@@ -770,8 +777,8 @@ impl Pipeline {
                 self.publish_manifest().await;
             }
         } else {
-            failed.entry(from).or_default().push(Instant::now());
-            *context = None;
+            *failed.entry(from).or_default() += 1;
+            *inflight = None;
         }
     }
 
@@ -895,7 +902,7 @@ pub async fn run(
                             pipeline.storage_provider_hints.insert(peer, Instant::now());
                         }
                         FromSwarm::Request { .. } => {}
-                        FromSwarm::Response { peer, request_id, response } => {
+                        FromSwarm::Response { peer, response, .. } => {
                             match response {
                                 peyk::protocol::Response::IssuedStoragePermit { valid_for } => {
                                     let now = Instant::now();

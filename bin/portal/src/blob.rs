@@ -44,7 +44,7 @@ pub enum RemoteBlob {
     Failed
 }
 
-pub struct PushContext {
+pub struct InflightPush {
     pub to: PeerId,
     pub created_at: Instant
 }
@@ -52,8 +52,9 @@ pub struct PushContext {
 pub enum LocalChunk {
     AwaitingAssignment,
     Assigned {
-        context: Option<PushContext>,
-        failed: HashMap<PeerId, Vec<Instant>>,
+        path: PathBuf,
+        inflight: Option<InflightPush>,
+        failed: HashMap<PeerId, usize>,
     },
     // <owner>
     Pushed(PeerId)
@@ -75,7 +76,7 @@ pub enum LocalBlob {
         root_hash: Hash,
         merkle_leaves: Vec<Hash>,
         chunks: HashMap<Hash, LocalChunk>,
-        path: PathBuf,
+        base_path: PathBuf,
         _admission_permit: OwnedSemaphorePermit
     },
     AwaitingPublishManifest {
