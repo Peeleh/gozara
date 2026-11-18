@@ -7,7 +7,7 @@ use eyre::Result;
 use tracing::{info, warn, debug};
 use tokio::{
     sync::{mpsc, oneshot, Semaphore, OwnedSemaphorePermit},
-    time::{Instant, Duration, timeout, interval},
+    time::{Instant, Duration, interval},
 };
 use tokio_util::sync::CancellationToken;
 use blake3::Hash;
@@ -24,7 +24,13 @@ use crate::blob::{
     LocalBlob, LocalChunk, PushContext, RemoteBlob, RemoteChunk, PullContext
 };
 use peyk::{
-    blob_transfer, FromSwarm, ToSwarm,
+    blob_transfer,
+    blob_transfer::{
+        Direction, TransferPermit, IncomingTransfer, TransferOutcome, Outcome,
+        PUSH_PROTOCOL, PULL_PROTOCOL,
+        TIMEOUT_WINDOW
+    },
+    FromSwarm, ToSwarm,
     protocol::Manifest,
     request_pull
 };
@@ -35,9 +41,6 @@ const MANIFEST_RECORD_TTL: u64 = 3600;
 // provider hints are valid for 5 minutes
 const STORAGE_PROVIDER_HINT_DECAY: u64 = 5 * 60;
 
-// 60 seconds as a general timeout
-const TIMEOUT_WINDOW: u64 = 60;
-
 const MAX_RETRIES: usize = 5;
 
 // 30 minutes before a blob is marked as failed
@@ -45,14 +48,6 @@ const BLOB_STALE_DEADLINE: u64 = 30 * 60;
 
 // 5 minutes before a chunk is marked as failed
 const CHUNK_STALE_DEADLINE: u64 = 5 * 60;
-
-enum InternalMessage {
-    ChunkUploadResult {
-        id: Hash,
-        to: PeerId,
-        succeeded: bool, // todo: replace with io::Result
-    }
-}
 
 struct Pipeline {
     db_pool: PgPool,
@@ -63,12 +58,10 @@ struct Pipeline {
     storage_provider_hints: HashMap<PeerId, Instant>,
     storage_permits: HashMap<PeerId, Instant>,
 
-    tx_internal: mpsc::UnboundedSender<InternalMessage>,
-
     tx_swarm: mpsc::Sender<ToSwarm>,
 
     blob_transfer_control: peyk::Control,
-    tx_blob_transfer_events: mpsc::UnboundedSender<blob_transfer::TransferEvent>,
+    tx_transfer_outcome: mpsc::Sender<TransferOutcome>,
 
     // to gate i/o usage
     download_permit: Arc<Semaphore>,
@@ -78,10 +71,9 @@ struct Pipeline {
 impl Pipeline {
     fn new(
         db_pool: PgPool,
-        tx_internal: mpsc::UnboundedSender<InternalMessage>,
         tx_swarm: mpsc::Sender<ToSwarm>,
         blob_transfer_control: peyk::Control,
-        tx_blob_transfer_events: mpsc::UnboundedSender<blob_transfer::TransferEvent>
+        tx_transfer_outcome: mpsc::Sender<TransferOutcome>
     ) -> Self {
         Pipeline {
             db_pool,
@@ -89,10 +81,9 @@ impl Pipeline {
             local_blob: None,
             storage_provider_hints: HashMap::new(),
             storage_permits: HashMap::new(),
-            tx_internal,
             tx_swarm,
             blob_transfer_control,
-            tx_blob_transfer_events,
+            tx_transfer_outcome,
             download_permit: Arc::new(Semaphore::new(32)), // 32 * 4 = 128 MiB of inflight downloads
             upload_permit: Arc::new(Semaphore::new(20)),   // 20 * 4 =  80 MiB of inflight uploads
         }
@@ -136,7 +127,7 @@ impl Pipeline {
                 root_hash, merkle_leaves, chunks, path, _admission_permit
             }
         ));
-        self.assign_chunks();
+        self.assign_chunks().await;
     }
 
     async fn handle_publish_manifest_result(
@@ -172,7 +163,7 @@ impl Pipeline {
             if *failed >= MAX_RETRIES {
                 *local_blob = LocalBlob::Failed;
                 debug!(blob = %local_id,
-                    "Max manifest publish attempts retries attempted, so blob has failed."
+                    "Max publish manifest retries reached, so blob has failed."
                 );
                 self.archive_local_blob().await;
             }
@@ -227,19 +218,20 @@ impl Pipeline {
     }
 
     async fn archive_local_blob(&mut self) {
-        let Some((_id, _local_blob)) = self.local_blob.take() else {
+        let Some((id, _local_blob)) = self.local_blob.take() else {
             return
         };
+        info!(blob = %id, "Archiving local blob.");
         // todo: archival
     }
 
-    fn assign_chunks(&mut self) {
+    async fn assign_chunks(&mut self) {
         let num_available_permits = self.upload_permit.available_permits();
         if num_available_permits == 0 {
             // nothing to be done
             return
         }
-        let Some((local_id, LocalBlob::Distributing { chunks, path, .. })) = &mut self.local_blob else {
+        let Some((_id, LocalBlob::Distributing { chunks, path, .. })) = &mut self.local_blob else {
             return
         };
         let now = Instant::now();
@@ -268,7 +260,6 @@ impl Pipeline {
             },
             _ => false
         };
-        let mut rng = rand::rng();
         for (&hash, chunk) in chunks
             .iter_mut()
             .filter(|(_, c)| is_eligible(c, &peers))
@@ -290,6 +281,7 @@ impl Pipeline {
             });
             // todo: peer selection strategy(fastest, most reliable, ...)
             let peer = {
+                let mut rng = rand::rng();
                 use rand::seq::IndexedRandom;
                 let Some(peer) = eligible_peers.choose(&mut rng) else {
                     continue
@@ -309,46 +301,18 @@ impl Pipeline {
                 LocalChunk::Assigned { failed, .. } => failed.clone(),
                 _ => continue
             };
-            let chunk_path = path.as_path().join(&hash_str);
             let context = Some(PushContext { to: peer, created_at: now });
             *chunk = LocalChunk::Assigned { context, failed };
-            let tx_internal = self.tx_internal.clone();
-            let control = self.blob_transfer_control.clone();
-            let tx_events = self.tx_blob_transfer_events.clone();
-            tokio::spawn(async move {
-                debug!(chunk = %hash_str, to = %peer, "Upload is initiated.");
-                let upload_result = timeout(
-                    Duration::from_secs(TIMEOUT_WINDOW),
-                    blob_transfer::push(control, peer, hash, &chunk_path, tx_events)
-                ).await;
-                drop(permit);
-                match upload_result {
-                    Ok(Ok(_)) => {
-                        debug!(chunk = %hash_str, to = %peer, dur = now.elapsed().as_secs_f32(),
-                            "Upload finished successfully."
-                        );
-                        let _ = tx_internal.send(InternalMessage::ChunkUploadResult {
-                            id: hash, to: peer, succeeded: true
-                        });
-                    }
-                    Ok(Err(e)) => {
-                        warn!(chunk = %hash_str, to = %peer, error = %e,
-                            dur = now.elapsed().as_secs_f32(), "Upload failed."
-                        );
-                        let _ = tx_internal.send(InternalMessage::ChunkUploadResult {
-                            id: hash, to: peer, succeeded: false
-                        });
-                    }
-                    Err(_) => {
-                        let _ = tx_internal.send(InternalMessage::ChunkUploadResult {
-                            id: hash, to: peer, succeeded: false
-                        });
-                        warn!(chunk = %hash_str, to = %peer, dur = now.elapsed().as_secs_f32(),
-                            "Upload has timed out."
-                        );
-                    }
-                };
-            });
+            // push it
+            debug!(chunk = %hash_str, to = %peer, "Chunk push is initiated.");
+            let _ = blob_transfer::push(
+                self.blob_transfer_control.clone(),
+                peer,
+                hash,
+                path.as_path().join(&hash_str),
+                permit,
+                self.tx_transfer_outcome.clone(),
+            );
         }
     }
 
@@ -422,8 +386,8 @@ impl Pipeline {
         peer: PeerId,
         req_id: OutboundRequestId
     ) {
-        let Some((_, RemoteBlob::Gathering { chunks, .. })) = &mut self.remote_blob else {
-            debug!(chunk = %id, "Unsolicited pull chunk ACK.");
+        let Some((_, RemoteBlob::Gathering { chunks, path, .. })) = &mut self.remote_blob else {
+            debug!(chunk = %id, "Unsolicited pull chunk ACK: not gathering.");
             return
         };
         let Ok(hash) = Hash::from_hex(id.as_bytes()) else {
@@ -431,7 +395,7 @@ impl Pipeline {
             return
         };
         let Some(chunk) = chunks.get_mut(&hash) else {
-            debug!(chunk = %id, "Unsolicited pull chunk ACK.");
+            debug!(chunk = %id, "Unsolicited pull chunk ACK: chunk not found.");
             return
         };
         match chunk {
@@ -456,22 +420,29 @@ impl Pipeline {
                     );
                     return
                 }
-                let Some(permit) = self
+                let Ok(permit) = self
                     .download_permit
                     .clone()
                     .try_acquire_owned()
-                    .ok()
                 else {
-                    debug!(chunk = %id, from = %peer,
-                        "Not enough download permit for the pull chunk ACK."
-                    );
+                    debug!(chunk = %id, from = %peer, "No pull permit to proceed.");
                     return
                 };
                 *context = Some(PullContext {
                     from: peer,
-                    permit: Some(permit),
                     created_at: Instant::now()
                 });
+                // pull it
+                debug!(chunk = %id, from = %peer, "Chunk pull is initiated.");
+                let _ = blob_transfer::pull(
+                    self.blob_transfer_control.clone(),
+                    peer,
+                    hash,
+                    path.as_path().join(&hash.to_string()),
+                    CHUNK_SIZE,
+                    permit,
+                    self.tx_transfer_outcome.clone(),
+                );
             }
             RemoteChunk::Failed => {
                 // todo
@@ -507,7 +478,7 @@ impl Pipeline {
                 if chunks.iter().any(|(_, chunk)|
                     matches!(chunk, LocalChunk::AwaitingAssignment | LocalChunk::Assigned { .. })
                 ) {
-                    self.assign_chunks();
+                    self.assign_chunks().await;
                 }
             }
             LocalBlob::AwaitingPublishManifest { attempts, .. } => {
@@ -677,96 +648,254 @@ impl Pipeline {
         let Some((id, remote_blob)) = self.remote_blob.take() else {
             return
         };
+        debug!(blob = %id, "Archiving remote blob.");
         // todo: archival
     }
 
-    async fn handle_incoming_push(
+    fn handle_incoming_push_request(
         &mut self,
-        in_push: blob_transfer::IncomingPush
+        from: PeerId,
+        hash: Hash,
+        reply_tx: oneshot::Sender<Option<TransferPermit>>
     ) {
+        debug!(hash = %hash.to_hex(), from = %from, "A new incoming push request.");
         let Some((_, RemoteBlob::Gathering { chunks, path, .. })) = self.remote_blob.as_mut() else {
+            let _ = reply_tx.send(None);
+            debug!("Remote blob is not gathering.");
             return
         };
-        match in_push {
-            blob_transfer::IncomingPush::Request { peer, hash, len, reply_tx } => {
-                let pull_permit = chunks
-                    .get_mut(&hash)
-                    .and_then(|chunk| match chunk {
-                        RemoteChunk::Pulling { context, .. } => {
-                            context
-                                .as_mut()
-                                .and_then(|pull_context|
-                                    if pull_context.from == peer {
-                                        Some(blob_transfer::IOPermit {
-                                            path: path.as_path().join(hash.to_string()),
-                                            permit: pull_context.permit.take().unwrap()
-                                        })
-                                    } else {
-                                        None
-                                    }
-                                )
-                        }
-                        _ => None
-                    });
-                if pull_permit.is_none() {
-                    debug!(hash = %hash.to_hex(), from = %peer, len = %len,
-                        "Unsolicited incoming push."
-                    );
-                };
-                let _ = reply_tx.send(pull_permit);
-            }
-            blob_transfer::IncomingPush::Finished { hash, succeeded } => {
-                let Some(chunk) = chunks.get_mut(&hash) else {
-                    debug!(hash = %hash.to_hex(), "Unsolicited incoming push result.");
-                    return
-                };
-                let RemoteChunk::Pulling { requests, context, failed } = chunk else {
-                    debug!(hash = %hash.to_hex(), "Unsolicited incoming push result: not pulling.");
-                    return
-                };
-                let Some(PullContext { from, .. }) = context else {
-                    debug!(hash = %hash.to_hex(), "Unsolicited incoming push result: no context.");
-                    return
-                };
-                if succeeded {
-                    *chunk = RemoteChunk::Pulled(*from);
-                    if chunks.values().all(|c| matches!(c, RemoteChunk::Pulled(_))) {
-                        self.archive_remote_blob().await;
-                    }
-                } else {
-                    let _ = requests.remove(from);
-                    failed.entry(*from).or_default().push(Instant::now());
-                    *context = None;
-                }
-            }
+        let Some(RemoteChunk::Pulling { requests, context, failed }) = chunks.get_mut(&hash) else {
+            let _ = reply_tx.send(None);
+            debug!("Chunk is not pulling or is missing.");
+            return
         };
+        if context.is_some() {
+            let _ = reply_tx.send(None);
+            debug!("Another pull already underway.");
+            return
+        }
+        if let Some(attempts) = failed.get(&from) {
+            if attempts.len() >= MAX_RETRIES {
+                debug!("Max pull retries already attempted for this peer.");
+                let _ = reply_tx.send(None);
+                return
+            }
+        }
+        if !requests.contains_key(&from) {
+            debug!("Unsolicited request.");
+            let _ = reply_tx.send(None);
+            return
+        }
+        let Ok(permit) = self
+            .download_permit
+            .clone()
+            .try_acquire_owned()
+        else {
+            debug!(hash = %hash.to_hex(), from = %from, "Could not obtain a pull permit.");
+            let _ = reply_tx.send(None);
+            return
+        };
+        *context = Some(PullContext {
+            from,
+            created_at: Instant::now()
+        });
+        let _ = reply_tx.send(Some(
+            TransferPermit {
+                path: path.as_path().join(hash.to_string()),
+                permit
+            }
+        ));
     }
 
-    fn handle_incoming_pull(
-        &self,
-        in_pull: blob_transfer::IncomingPull
+    fn handle_incoming_pull_request(
+        &mut self,
+        from: PeerId,
+        hash: Hash,
+        reply_tx: oneshot::Sender<Option<TransferPermit>>
     ) {
-        // todo: check the db too
-        let Some((id, LocalBlob::Distributing { chunks, path, .. })) = self.local_blob.as_ref() else {
+        debug!(hash = %hash.to_hex(), from = %from, "A new incoming pull request.");
+        let Some((_id, LocalBlob::Distributing { chunks, path, .. })) =
+            self.local_blob.as_mut()
+        else {
+            let _ = reply_tx.send(None);
+            debug!("Local blob is not distributing.");
             return
         };
-        let pull_permit = if chunks.contains_key(&in_pull.hash) {
-            self
-                .upload_permit
-                .clone()
-                .try_acquire_owned()
-                .ok()
-                .map(|permit| {
-                    let chunk_path = path.as_path().join(&in_pull.hash.to_string());
-                    blob_transfer::IOPermit { path: chunk_path, permit }
-                })
-        } else {
-            debug!(hash = %in_pull.hash.to_hex(), from = %in_pull.peer,
-                "Unsolicited incoming pull."
-            );
-            None
+        let Some(LocalChunk::Assigned { context, failed }) = chunks.get_mut(&hash) else {
+            let _ = reply_tx.send(None);
+            debug!("Chunk is not assigned or is missing.");
+            return
         };
-        in_pull.reply(pull_permit);
+        if context.is_some() {
+            let _ = reply_tx.send(None);
+            debug!("Another pull is already underway.");
+            return
+        }
+        if let Some(attempts) = failed.get(&from) {
+            if attempts.len() >= MAX_RETRIES {
+                debug!("Max push retries already attempted for this peer.");
+                let _ = reply_tx.send(None);
+                return
+            }
+        }
+
+        let Ok(permit) = self
+            .upload_permit
+            .clone()
+            .try_acquire_owned()
+        else {
+            debug!("Could not obtain a push permit.");
+            let _ = reply_tx.send(None);
+            return
+        };
+        *context = Some(PushContext {
+            to: from,
+            created_at: Instant::now()
+        });
+        let _ = reply_tx.send(Some(
+            TransferPermit {
+                path: path.as_path().join(&hash.to_string()),
+                permit
+            }
+        ));
+    }
+
+    async fn handle_transfer_outcome_for_local_blob(
+        &mut self,
+        from: PeerId,
+        hash: Hash,
+        succeeded: bool
+    ) {
+        let Some((_id, local_blob)) = self.local_blob.as_mut() else {
+            return
+        };
+        debug!(chunk = %hash.to_hex(), from = %from, succeeded = %succeeded,
+            "A new outcome for the local blob."
+        );
+        let LocalBlob::Distributing { root_hash, merkle_leaves, chunks, .. } = local_blob
+        else {
+            debug!("Local blob is no distributing.");
+            return
+        };
+        let Some(chunk) = chunks.get_mut(&hash) else {
+            debug!("Unsolicited chunk.");
+            return
+        };
+        let LocalChunk::Assigned { context, failed } = chunk else {
+            debug!("Not pushing.");
+            return
+        };
+        let Some(PushContext { to, .. }) = context else {
+            debug!("No push context.");
+            // todo: late success
+            return
+        };
+        if *to != from {
+            debug!(expected = %to, "Peers do not match.");
+            return
+        }
+        if succeeded {
+            *chunk = LocalChunk::Pushed(from);
+            if chunks.values().all(|c| matches!(c, LocalChunk::Pushed(_))) {
+                let manifest = Manifest::Blob {
+                    root_hash: *root_hash.as_bytes(),
+                    chunks: merkle_leaves
+                        .iter()
+                        .map(|h| (
+                            *h.as_bytes(),
+                            chunks
+                                .get(h)
+                                .unwrap()
+                                .extract_owner()
+                                .unwrap()
+                        ))
+                        .collect()
+                };
+                *local_blob = LocalBlob::AwaitingPublishManifest {
+                    manifest,
+                    attempts: vec![],
+                    failed: 0
+                };
+                self.publish_manifest().await;
+            }
+        } else {
+            failed.entry(from).or_default().push(Instant::now());
+            *context = None;
+        }
+    }
+
+    async fn handle_transfer_outcome_for_remote_blob(
+        &mut self,
+        from: PeerId,
+        hash: Hash,
+        succeeded: bool
+    ) {
+        debug!(chunk = %hash.to_hex(), succeeded = %succeeded, from = %from,
+            "A new outcome for the remote blob."
+        );
+        let Some((_id, RemoteBlob::Gathering { chunks, .. })) =
+            self.remote_blob.as_mut()
+        else {
+            debug!("Remote blob is not gathering.");
+            return
+        };
+        let Some(chunk) = chunks.get_mut(&hash) else {
+            debug!("Chunk not found.");
+            return
+        };
+        let RemoteChunk::Pulling { requests, context, failed } = chunk else {
+            debug!("Chunk not pulling.");
+            return
+        };
+        let Some(PullContext { from: ex_from, .. }) = context else {
+            debug!("No pull context for the chunk.");
+            return
+        };
+        if *ex_from != from {
+            debug!(expected = %ex_from, "Peers do not match.");
+            return
+        }
+        if succeeded {
+            *chunk = RemoteChunk::Pulled(from);
+            if chunks.values().all(|c| matches!(c, RemoteChunk::Pulled(_))) {
+                self.archive_remote_blob().await;
+            }
+        } else {
+            let _ = requests.remove(&from);
+            failed.entry(from).or_default().push(Instant::now());
+            *context = None;
+            // todo: failed decision flow
+        }
+    }
+
+    async fn handle_incoming_transfer_outcome(
+        &mut self,
+        from: PeerId,
+        hash: Hash,
+        direction: Direction,
+        succeeded: bool
+    ) {
+        match direction {
+            Direction::Pull =>
+                self.handle_transfer_outcome_for_local_blob(from, hash, succeeded).await,
+            Direction::Push =>
+                self.handle_transfer_outcome_for_remote_blob(from, hash, succeeded).await
+        }
+    }
+
+    async fn handle_outgoing_transfer_outcome(
+        &mut self,
+        from: PeerId,
+        hash: Hash,
+        direction: Direction,
+        succeeded: bool
+    ) {
+        match direction {
+            Direction::Pull =>
+                self.handle_transfer_outcome_for_remote_blob(from, hash, succeeded).await,
+            Direction::Push =>
+                self.handle_transfer_outcome_for_local_blob(from, hash, succeeded).await
+        }
     }
 }
 
@@ -779,22 +908,24 @@ pub async fn run(
     shutdown: CancellationToken
 ) -> Result<tokio::task::JoinHandle<()>> {
     //  setup blob transfer
-    let mut incoming_pushes = blob_transfer::accept_pushes(
-        blob_transfer_control.accept(blob_transfer::PUSH_PROTOCOL)?,
+    let (tx_incoming_transfer, mut rx_incoming_transfer) = mpsc::channel(128);
+    let (tx_transfer_outcome, mut rx_transfer_outcome) = mpsc::channel(256);
+    blob_transfer::accept_pushes(
+        blob_transfer_control.accept(PUSH_PROTOCOL)?,
         CHUNK_SIZE,
+        tx_incoming_transfer.clone(),
+        tx_transfer_outcome.clone()
     );
-    let mut incoming_pulls = blob_transfer::accept_pulls(
-        blob_transfer_control.accept(blob_transfer::PULL_PROTOCOL)?
+    blob_transfer::accept_pulls(
+        blob_transfer_control.accept(PULL_PROTOCOL)?,
+        tx_incoming_transfer,
+        tx_transfer_outcome.clone()
     );
-    let (tx_blob_transfer_events, mut rx_blob_transfer_event) =
-        mpsc::unbounded_channel::<blob_transfer::TransferEvent>();
-    let (tx_internal, mut rx_internal) = mpsc::unbounded_channel::<InternalMessage>();
     let mut pipeline = Pipeline::new(
         db_pool,
-        tx_internal,
         tx_swarm,
         blob_transfer_control,
-        tx_blob_transfer_events
+        tx_transfer_outcome
     );
     let mut timer_maintenance = interval(Duration::from_secs(10));
     let jh = tokio::spawn(async move {
@@ -826,7 +957,7 @@ pub async fn run(
                                         .unwrap_or(now)
                                     );
                                     // todo: storage permit is already invalid in case of overflow
-                                    pipeline.assign_chunks();
+                                    pipeline.assign_chunks().await;
                                 }
                                 peyk::protocol::Response::PullChunkAck(id) => {
                                     pipeline.handle_pull_chunk_ack(id, peer, request_id).await;
@@ -869,98 +1000,32 @@ pub async fn run(
                         break
                     }
                 },
-                // internal messages
-                im = rx_internal.recv() => match im {
-                    Some(i_msg) => match i_msg {
-                        InternalMessage::ChunkUploadResult { id, to: peer, succeeded } => {
-                            let hash_str = id.to_string();
-                            debug!(chunk = %hash_str, to = %peer, succeeded = %succeeded,
-                                "New upload result."
-                            );
-                            let Some(
-                                (
-                                    blob_id,
-                                    LocalBlob::Distributing { root_hash, merkle_leaves, chunks, .. }
-                                )
-                            ) = &mut pipeline.local_blob else {
-                                debug!("The local blob is not `distributing`.");
-                                continue
-                            };
-                            let Some(chunk) = chunks.get_mut(&id) else {
-                                warn!("Missing chunk.");
-                                continue
-                            };
-                            match chunk {
-                                LocalChunk::Assigned { context, failed, .. } => {
-                                    if succeeded {
-                                        *chunk = LocalChunk::Pushed(peer);
-                                        if chunks
-                                            .values()
-                                            .all(|chunk| matches!(chunk, LocalChunk::Pushed(_)))
-                                        {
-                                            let manifest = Manifest::Blob {
-                                                root_hash: *root_hash.as_bytes(),
-                                                chunks: merkle_leaves
-                                                    .iter()
-                                                    .map(|h| (
-                                                        *h.as_bytes(),
-                                                        chunks
-                                                            .get(h)
-                                                            .unwrap()
-                                                            .extract_owner()
-                                                            .unwrap()
-                                                    ))
-                                                    .collect()
-                                            };
-                                            pipeline.local_blob = Some((
-                                                blob_id.clone(),
-                                                LocalBlob::AwaitingPublishManifest {
-                                                    manifest,
-                                                    attempts: vec![],
-                                                    failed: 0
-                                                }
-                                            ));
-                                            pipeline.publish_manifest().await;
-                                        }
-                                    } else {
-                                        failed.entry(peer).or_default().push(Instant::now());
-                                        *context = None;
-                                    }
-                                }
-                                _ => {
-                                    debug!(chunk = %hash_str, "Unsolicited upload result.");
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        warn!("Internal channel is closed.");
-                        break
-                    }
-                },
                 // <blob transfer>
-                // pushes
-                p = incoming_pushes.recv() => match p {
-                    Some(push_req) => {
-                        pipeline.handle_incoming_push(push_req).await;
+                // incoming transfers
+                r = rx_incoming_transfer.recv() => match r {
+                    Some(IncomingTransfer { from, hash, direction, reply_tx }) => match direction {
+                        Direction::Pull => (), // assing_chunks handles this
+                        Direction::Push => {
+                            pipeline.handle_incoming_push_request(from, hash, reply_tx);
+                        }
                     },
                     None => {
                         break
                     }
                 },
-                // pulls
-                p = incoming_pulls.recv() => match p {
-                    Some(pull_req) => {
-                        pipeline.handle_incoming_pull(pull_req);
-                    },
-                    None => {
-                        break
-                    }
-                },
-                // events
-                e = rx_blob_transfer_event.recv() => match e {
-                    Some(a) => {
-                        debug!(event = ?a);
+                // outcomes
+                o = rx_transfer_outcome.recv() => match o {
+                    Some(outcome) => match outcome {
+                        TransferOutcome::Incoming(Outcome { peer, hash, direction, succeeded }) => {
+                            pipeline.handle_incoming_transfer_outcome(
+                                peer, hash, direction, succeeded
+                            ).await;
+                        }
+                        TransferOutcome::Outgoing(Outcome { peer, hash, direction, succeeded }) => {
+                            pipeline.handle_outgoing_transfer_outcome(
+                                peer, hash, direction, succeeded
+                            ).await;
+                        }
                     }
                     None => {
                         break

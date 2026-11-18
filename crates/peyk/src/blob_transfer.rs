@@ -30,7 +30,7 @@ use tempfile::{NamedTempFile, TempPath};
 use tokio::{
     fs::File,
     sync::{mpsc, oneshot, OwnedSemaphorePermit},
-    time::{Duration, timeout}
+    time::{Instant, Duration, timeout}
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::debug;
@@ -38,15 +38,17 @@ use tracing::debug;
 pub const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/gozara/blob-push/1.0.0/");
 pub const PULL_PROTOCOL: StreamProtocol = StreamProtocol::new("/gozara/blob-pull/1.0.0/");
 
-const TIMEOUT_WINDOW: u64 = 60;
+// 60 seconds
+pub const TIMEOUT_WINDOW: u64 = 60;
+
 const TAG_NO: u8 = 0;
 const TAG_YES: u8 = 1;
+
 /// rejection reason length: 256 bytes ~20 unicode words
 const MAX_REASON_LEN: usize = 1<<8;
+
 /// 64kb buffer
 const IO_BUF_LEN: usize = 1<<16;
-
-const CHANNEL_SIZE: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -54,16 +56,24 @@ pub enum Direction {
     Pull,
 }
 
+#[derive(Debug)]
+pub struct TransferPermit {
+    pub path: PathBuf,
+    pub permit: OwnedSemaphorePermit
+}
+
 #[derive(Debug, Clone)]
-pub struct TransferEvent {
+pub struct Outcome {
     pub peer: PeerId,
     pub hash: Hash,
-    /// Bytes moved; `0` unless the transfer succeeded.
-    pub len: usize,
     pub direction: Direction,
-    /// `true` only if a payload was transferred and verified, so a pull the peer couldn't serve
-    /// is `false`.
-    pub ok: bool,
+    pub succeeded: bool
+}
+
+#[derive(Debug, Clone)]
+pub enum TransferOutcome {
+    Incoming(Outcome),
+    Outgoing(Outcome)
 }
 
 async fn write_frame<W: AsyncWrite + Unpin>(io: &mut W, bytes: &[u8]) -> Result<()> {
@@ -73,7 +83,6 @@ async fn write_frame<W: AsyncWrite + Unpin>(io: &mut W, bytes: &[u8]) -> Result<
     Ok(())
 }
 
-/// Reads a frame's length prefix and checks it against `max_len`.
 async fn read_len<R: AsyncRead + Unpin>(io: &mut R, max_len: usize) -> Result<usize> {
     let mut len_buf = [0u8; 4];
     io.read_exact(&mut len_buf).await?;
@@ -158,7 +167,7 @@ async fn push_inner(
     peer: PeerId,
     hash: Hash,
     path: &Path
-) -> Result<usize> {
+) -> Result<()> {
     let (file, len) = open_for_send(path).await?;
     let mut stream = control
         .open_stream(peer, PUSH_PROTOCOL)
@@ -169,7 +178,7 @@ async fn push_inner(
     send_file(&mut stream, file, len).await?;
 
     let result = if read_tag(&mut stream).await? {
-        Ok(len as usize)
+        Ok(())
     } else {
         let reason = read_frame(&mut stream, MAX_REASON_LEN).await?;
         Err(eyre!("push rejected: {}", String::from_utf8_lossy(&reason)))
@@ -178,26 +187,57 @@ async fn push_inner(
     result
 }
 
-pub async fn push(
+pub fn push(
     mut control: Control,
     peer: PeerId,
     hash: Hash,
-    path: &Path,
-    events_tx: mpsc::UnboundedSender<TransferEvent>,
+    path: PathBuf,
+    permit: OwnedSemaphorePermit,
+    tx_outcome: mpsc::Sender<TransferOutcome>,
 ) -> Result<()> {
-    let result = push_inner(&mut control, peer, hash, path).await;
-    let len = match &result {
-        Ok(len) => *len,
-        Err(_) => 0,
-    };
-    let _ = events_tx.send(TransferEvent {
-        peer,
-        hash,
-        len,
-        direction: Direction::Push,
-        ok: result.is_ok(),
+    let onset = Instant::now();
+    tokio::spawn(async move {
+        let result = timeout(
+            Duration::from_secs(TIMEOUT_WINDOW),
+            push_inner(&mut control, peer, hash, &path)
+        ).await;
+        drop(permit);
+        match result {
+            Ok(Ok(_)) => {
+                let _ = tx_outcome.send(TransferOutcome::Outgoing(Outcome {
+                    peer,
+                    hash,
+                    direction: Direction::Push,
+                    succeeded: true
+                })).await;
+                debug!(hash = %hash.to_hex(), to = %peer,
+                    duration = Instant::now().duration_since(onset).as_secs(),
+                    "Push finished with success."
+                );
+            }
+            Ok(Err(e)) => {
+                let _ = tx_outcome.send(TransferOutcome::Outgoing(Outcome {
+                    peer,
+                    hash,
+                    direction: Direction::Push,
+                    succeeded: false
+                })).await;
+                debug!(hash = %hash.to_hex(), to = %peer, error = %e,
+                    duration = Instant::now().duration_since(onset).as_secs(),
+                    "Push failed.");
+            }
+            Err(_) => {
+                let _ = tx_outcome.send(TransferOutcome::Outgoing(Outcome {
+                    peer,
+                    hash,
+                    direction: Direction::Push,
+                    succeeded: false
+                })).await;
+                debug!(chunk = %hash.to_hex(), to = %peer, "Push failed: timeout.");
+            }
+        }
     });
-    result.map(|_| ())
+    Ok(())
 }
 
 async fn receive_to_temp<R: AsyncRead + Unpin>(
@@ -224,7 +264,6 @@ async fn receive_to_temp<R: AsyncRead + Unpin>(
     Ok((hasher.finalize(), temp_path))
 }
 
-/// Moves a verified temp file into place, replacing whatever is at `dest`.
 fn persist(temp_path: TempPath, dest: &Path) -> Result<()> {
     temp_path.persist(dest).map_err(|e| {
         eyre!(
@@ -241,7 +280,7 @@ async fn pull_inner(
     hash: Hash,
     dest: &Path,
     max_payload_len: usize,
-) -> Result<Option<usize>> {
+) -> Result<()> {
     let Some(dir) = dest.parent() else {
         return Err(eyre!(format!("no parent for {}", dest.display())));
     };
@@ -251,136 +290,180 @@ async fn pull_inner(
         .map_err(|e| eyre!("failed to open stream to {peer}: {e}"))?;
 
     write_frame(&mut stream, hash.as_slice()).await?;
-    let stored = if read_tag(&mut stream).await? {
+    if read_tag(&mut stream).await? {
         let len = read_len(&mut stream, max_payload_len).await?;
         let (actual, temp_path) = receive_to_temp(&mut stream, len, dir).await?;
         if actual != hash {
             return Err(eyre!("pull hash mismatch: expected {hash}, got {actual}"));
         }
         persist(temp_path, dest)?;
-        Some(len)
     } else {
-        None
-    };
+        return Err(eyre!("pull failed: read tag is 0"));
+    }
     finish(&mut stream, peer, Direction::Pull).await;
-    Ok(stored)
+    Ok(())
 }
 
-pub async fn pull(
+pub fn pull(
     mut control: Control,
     peer: PeerId,
     hash: Hash,
-    dest: &Path,
+    dest: PathBuf,
     max_payload_len: usize,
-    events_tx: mpsc::UnboundedSender<TransferEvent>,
-) -> Result<Option<usize>> {
-    let result = pull_inner(&mut control, peer, hash, dest, max_payload_len).await;
-    let len = match &result {
-        Ok(Some(len)) => *len,
-        _ => 0,
-    };
-    let _ = events_tx.send(TransferEvent {
-        peer,
-        hash,
-        len,
-        direction: Direction::Pull,
-        ok: matches!(result, Ok(Some(_))),
+    permit: OwnedSemaphorePermit,
+    tx_outcome: mpsc::Sender<TransferOutcome>
+) -> Result<()> {
+    let onset = Instant::now();
+    tokio::spawn(async move {
+        let result = timeout(
+            Duration::from_secs(TIMEOUT_WINDOW),
+            pull_inner(&mut control, peer, hash, &dest, max_payload_len)
+        ).await;
+        drop(permit);
+        match result {
+            Ok(Ok(_)) => {
+                let _ = tx_outcome.send(TransferOutcome::Outgoing(Outcome {
+                    peer,
+                    hash,
+                    direction: Direction::Pull,
+                    succeeded: true
+                })).await;
+                debug!(from = %peer, hash = %hash.to_hex(),
+                    duration = Instant::now().duration_since(onset).as_secs(),
+                    "Pull finished with success."
+                );
+            }
+            Ok(Err(e)) => {
+                let _ = tx_outcome.send(TransferOutcome::Outgoing(Outcome {
+                    peer,
+                    hash,
+                    direction: Direction::Pull,
+                    succeeded: false
+                })).await;
+                debug!(from = %peer, hash = %hash.to_hex(), error = %e,
+                    duration = Instant::now().duration_since(onset).as_secs(),
+                    "Pull failed."
+                );
+            }
+            Err(_) => {
+                let _ = tx_outcome.send(TransferOutcome::Outgoing(Outcome {
+                    peer,
+                    hash,
+                    direction: Direction::Pull,
+                    succeeded: false
+                })).await;
+                debug!(chunk = %hash.to_hex(), from = %peer, "Pull failed: timeout.");
+            }
+        }
     });
-    result
+    Ok(())
 }
 
 #[derive(Debug)]
-#[allow(unused)]
-pub struct IOPermit {
-    pub path: PathBuf,
-    pub permit: OwnedSemaphorePermit
-}
-
-#[derive(Debug)]
-pub enum IncomingPush {
-    Request {
-        peer: PeerId,
-        hash: Hash,
-        len: usize,
-        reply_tx: oneshot::Sender<Option<IOPermit>>
-    },
-    Finished {
-        hash: Hash,
-        succeeded: bool
-    }
-}
-
-
-#[derive(Debug)]
-pub struct IncomingPull {
-    pub peer: PeerId,
+pub struct IncomingTransfer {
+    pub from: PeerId,
     pub hash: Hash,
-    reply_tx: oneshot::Sender<Option<IOPermit>>,
-}
-
-impl IncomingPull {
-    pub fn reply(self, pull_permit: Option<IOPermit>) {
-        let _ = self.reply_tx.send(pull_permit);
-    }
+    pub direction: Direction,
+    pub reply_tx: oneshot::Sender<Option<TransferPermit>>
 }
 
 async fn handle_incoming_push(
     mut stream: impl AsyncRead + AsyncWrite + Unpin,
     peer: PeerId,
     max_payload_len: usize,
-    tx: mpsc::Sender<IncomingPush>
-) -> Result<()> {
-    let expected = read_hash(&mut stream).await?;
-    let len = read_len(&mut stream, max_payload_len).await?;
+    tx: mpsc::Sender<IncomingTransfer>
+) -> Result<Option<Hash>, Hash> {
+    let expected = match read_hash(&mut stream).await {
+        Ok(h) => h,
+        Err(e) => {
+            debug!(peer = %peer, error = %e, "Incoming push failed: read_hash.");
+            return Ok(None)
+        }
+    };
+    let len = match read_len(&mut stream, max_payload_len).await {
+        Ok(l) => l,
+        Err(e) => {
+            debug!(peer = %peer, error = %e, "Incoming push failed: read_len.");
+            return Ok(None)
+        }
+    };
     let (reply_tx, rx) = oneshot::channel();
-    if tx.send(IncomingPush::Request { peer, hash: expected, len, reply_tx }).await.is_err() {
+    if tx.send(IncomingTransfer {
+        from: peer,
+        hash: expected,
+        direction: Direction::Push,
+        reply_tx
+    }).await.is_err() {
         let _ = write_rejection(&mut stream, "receiver is not available").await;
-        return Err(eyre!("failed to notify the pipeline about an incoming push"));
+        return Ok(None)
     }
     let Some(push_permit) = rx.await.ok().flatten() else {
         let _ = write_rejection(&mut stream, "push refused").await;
-        return Err(eyre!("push refused"));
+        return Ok(None)
     };
     let Some(dir) = push_permit.path.parent() else {
-        let reason = format!("interal error");
-        let _ = write_rejection(&mut stream, &reason).await;
-        let _ = tx.send(IncomingPush::Finished { hash: expected, succeeded: false }).await;
-        return Err(eyre!("no parent for {}", push_permit.path.display()));
+        let reason = "internal error";
+        let _ = write_rejection(&mut stream, reason).await;
+        debug!(peer = %peer, chunk = %expected.to_hex(), path = %push_permit.path.display(),
+            "Incoming push failed: no parent directory."
+        );
+        return Err(expected)
     };
-    let (actual, temp_path) = receive_to_temp(&mut stream, len, dir).await?;
+    let Ok((actual, temp_path)) = receive_to_temp(&mut stream, len, dir).await else {
+        return Err(expected)
+    };
     if actual != expected {
         let reason = format!("integrity check failed (got {actual})");
         let _ = write_rejection(&mut stream, &reason).await;
-        let _ = tx.send(IncomingPush::Finished { hash: expected, succeeded: false }).await;
-        return Err(eyre!(
-            "hash mismatch for the incoming push: expected {expected}, got {actual}"
-        ));
+        debug!(expected = %expected.to_hex(), given = %actual.to_hex(),
+            "Incoming push failed: hash mismatch."
+        );
+        return Err(expected)
     }
-
-    persist(temp_path, &push_permit.path)?;
-
-    stream.write_all(&[TAG_YES]).await?;
+    if let Err(e) = persist(temp_path, &push_permit.path){
+        debug!(peer = %peer, error = %e, "Incoming push failed: persist.");
+        return Err(expected)
+    };
+    if let Err(e) = stream.write_all(&[TAG_YES]).await {
+        debug!(peer = %peer, error = %e, "Incoming push failed: write tag(yes).");
+        return Err(expected)
+    }
     finish(&mut stream, peer, Direction::Push).await;
-    let _ = tx.send(IncomingPush::Finished { hash: actual, succeeded: true }).await;
-    Ok(())
+    Ok(Some(expected))
 }
 
 pub fn accept_pushes(
     mut incoming: IncomingStreams,
     max_payload_len: usize,
-) -> mpsc::Receiver<IncomingPush> {
-    let (tx, rx) = mpsc::channel(CHANNEL_SIZE);
+    tx_incoming_transfer: mpsc::Sender<IncomingTransfer>,
+    tx_outcome: mpsc::Sender<TransferOutcome>
+) {
     tokio::spawn(async move {
         while let Some((peer, stream)) = incoming.next().await {
-            let tx = tx.clone();
+            let tx_incoming = tx_incoming_transfer.clone();
+            let tx_outcome = tx_outcome.clone();
             tokio::spawn(async move {
                 match timeout(
                     Duration::from_secs(TIMEOUT_WINDOW),
-                    handle_incoming_push(stream, peer, max_payload_len, tx)
+                    handle_incoming_push(stream, peer, max_payload_len, tx_incoming)
                 ).await {
-                    Ok(Ok(_)) => (),
-                    Ok(Err(e)) => {
-                        debug!(from = %peer, error = %e, "Incoming push failed.");
+                    Ok(Ok(maybe_hash)) => {
+                        if let Some(hash) = maybe_hash {
+                            let _ = tx_outcome.send(TransferOutcome::Incoming(Outcome {
+                                peer,
+                                hash,
+                                direction: Direction::Push,
+                                succeeded: true
+                            })).await;
+                        }
+                    },
+                    Ok(Err(hash)) => {
+                        let _ = tx_outcome.send(TransferOutcome::Incoming(Outcome {
+                            peer,
+                            hash,
+                            direction: Direction::Push,
+                            succeeded: false
+                        })).await;
                     }
                     Err(_) => {
                         debug!(from = %peer, "Incoming push failed: timeout.");
@@ -389,45 +472,84 @@ pub fn accept_pushes(
             });
         }
     });
-    rx
 }
 
 async fn handle_incoming_pull(
     mut stream: impl AsyncRead + AsyncWrite + Unpin,
     peer: PeerId,
-    tx: mpsc::Sender<IncomingPull>
-) -> Result<()> {
-    let hash = read_hash(&mut stream).await?;
+    tx: mpsc::Sender<IncomingTransfer>
+) -> Result<Option<Hash>, Hash> {
+    let hash = match read_hash(&mut stream).await {
+        Ok(h) => h,
+        Err(e) => {
+            debug!(from = %peer, error = %e, "Incoming pull failed: read_hash.");
+            return Ok(None)
+        }
+    };
     let (reply_tx, rx) = oneshot::channel();
-    let _ = tx.send(IncomingPull { peer, hash, reply_tx }).await;
+    let _ = tx.send(IncomingTransfer {
+        from: peer,
+        direction: Direction::Pull,
+        hash,
+        reply_tx
+    }).await;
     // No consumer, or one that drops the request unanswered, counts as "don't have it".
     let Some(pull_permit) = rx.await.ok().flatten() else {
-        stream.write_all(&[TAG_NO]).await?;
+        if stream.write_all(&[TAG_NO]).await.is_err() {
+            return Ok(None)
+        }
         finish(&mut stream, peer, Direction::Pull).await;
-        return Ok(());
+        return Ok(None)
     };
-    let (file, len) = open_for_send(&pull_permit.path).await?;
-    stream.write_all(&[TAG_YES]).await?;
-    send_file(&mut stream, file, len).await?;
+    let (file, len) = match open_for_send(&pull_permit.path).await {
+        Ok((f, l)) => (f, l),
+        Err(e) => {
+            debug!(from = %peer, error = %e, "Incoming pull failed: open_for_send.");
+            return Err(hash)
+        }
+    };
+    if let Err(e) = stream.write_all(&[TAG_YES]).await {
+        debug!(from = %peer, error = %e, "Incoming pull failed: write tag(yes).");
+        return Err(hash)
+    }
+    if send_file(&mut stream, file, len).await.is_err() {
+        return Err(hash)
+    }
     finish(&mut stream, peer, Direction::Pull).await;
-    Ok(())
+    Ok(Some(hash))
 }
 
 pub fn accept_pulls(
-    mut incoming: IncomingStreams
-) -> mpsc::Receiver<IncomingPull> {
-    let (tx, rx) = mpsc::channel(CHANNEL_SIZE);
+    mut incoming: IncomingStreams,
+    tx_incoming_transfer: mpsc::Sender<IncomingTransfer>,
+    tx_outcome: mpsc::Sender<TransferOutcome>
+) {
     tokio::spawn(async move {
         while let Some((peer, stream)) = incoming.next().await {
-            let tx = tx.clone();
+            let tx_incoming = tx_incoming_transfer.clone();
+            let tx_outcome = tx_outcome.clone();
             tokio::spawn(async move {
                 match timeout(
                     Duration::from_secs(TIMEOUT_WINDOW),
-                    handle_incoming_pull(stream, peer, tx)
+                    handle_incoming_pull(stream, peer, tx_incoming)
                 ).await {
-                    Ok(Ok(_)) => (),
-                    Ok(Err(e)) => {
-                        debug!(from = %peer, error = %e, "Incoming pull failed.");
+                    Ok(Ok(maybe_hash)) => {
+                        if let Some(hash) = maybe_hash {
+                            let _ = tx_outcome.send(TransferOutcome::Incoming(Outcome {
+                                peer,
+                                hash,
+                                direction: Direction::Pull,
+                                succeeded: true
+                            })).await;
+                        }
+                    },
+                    Ok(Err(hash)) => {
+                        let _ = tx_outcome.send(TransferOutcome::Incoming(Outcome {
+                            peer,
+                            hash,
+                            direction: Direction::Pull,
+                            succeeded: false
+                        })).await;
                     }
                     Err(_) => {
                         debug!(from = %peer, "Incoming pull failed: timeout.");
@@ -436,5 +558,4 @@ pub fn accept_pulls(
             });
         }
     });
-    rx
 }

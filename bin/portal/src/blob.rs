@@ -17,7 +17,6 @@ use peyk::protocol::Manifest;
 #[derive(Debug)]
 pub struct PullContext {
     pub from: PeerId,
-    pub permit: Option<OwnedSemaphorePermit>,
     pub created_at: Instant
 }
 
@@ -34,6 +33,7 @@ pub enum RemoteChunk {
 
 #[derive(Debug)]
 pub enum RemoteBlob {
+    // todo: entry time for timeouts
     AwaitingManifest(Vec<Instant>),
     Gathering {
         root_hash: Hash,
@@ -70,6 +70,7 @@ impl LocalChunk {
 }
 
 pub enum LocalBlob {
+    // todo: entry time for timeouts
     Distributing {
         root_hash: Hash,
         merkle_leaves: Vec<Hash>,
