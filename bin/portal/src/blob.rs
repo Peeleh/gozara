@@ -13,6 +13,7 @@ use libp2p::{
 use blake3::Hash;
 use peyk::protocol::Manifest;
 
+// remote blob
 #[derive(Debug)]
 pub struct InflightPull {
     pub from: PeerId,
@@ -44,6 +45,14 @@ pub enum RemoteBlob {
     Failed
 }
 
+pub struct RemoteBlobContext {
+    pub id: String,
+    pub created_at: Instant,
+    pub blob: RemoteBlob
+}
+
+// local blob
+#[derive(Debug)]
 pub struct InflightPush {
     pub to: PeerId,
     pub created_at: Instant
@@ -71,7 +80,6 @@ impl LocalChunk {
 }
 
 pub enum LocalBlob {
-    // todo: entry time for timeouts
     Distributing {
         root_hash: Hash,
         merkle_leaves: Vec<Hash>,
@@ -86,4 +94,10 @@ pub enum LocalBlob {
     },
     Published,
     Failed
+}
+
+pub struct LocalBlobContext {
+    pub id: String,
+    pub created_at: Instant,
+    pub blob: LocalBlob
 }

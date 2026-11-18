@@ -20,7 +20,8 @@ use crate::admission::{
     BASE_BLOB_PATH, ToPipeline, CHUNK_SIZE
 };
 use crate::blob::{
-    LocalBlob, LocalChunk, InflightPush, RemoteBlob, RemoteChunk, InflightPull
+    LocalBlobContext, LocalBlob, LocalChunk, InflightPush,
+    RemoteBlobContext, RemoteBlob, RemoteChunk, InflightPull
 };
 use peyk::{
     blob_transfer,
@@ -49,8 +50,8 @@ const CHUNK_STALE_DEADLINE: u64 = 5 * 60;
 
 struct Pipeline {
     db_pool: PgPool,
-    remote_blob: Option<(String, RemoteBlob)>,
-    local_blob: Option<(String, LocalBlob)>,
+    remote_blob: Option<RemoteBlobContext>,
+    local_blob: Option<LocalBlobContext>,
 
     // record decaying WouldStore gossips
     storage_provider_hints: HashMap<PeerId, Instant>,
@@ -95,7 +96,11 @@ impl Pipeline {
             warn!("Another remote blob is already being pulled.");
             return
         }
-        self.remote_blob = Some((id, RemoteBlob::AwaitingManifest(vec![])));
+        self.remote_blob = Some(RemoteBlobContext {
+            id,
+            created_at: Instant::now(),
+            blob: RemoteBlob::AwaitingManifest(vec![])
+        });
         self.maintain_remote_blob().await;
     }
 
@@ -119,12 +124,13 @@ impl Pipeline {
             .iter()
             .map(|hash| (*hash, LocalChunk::AwaitingAssignment))
             .collect();
-        self.local_blob = Some((
+        self.local_blob = Some(LocalBlobContext {
             id,
-            LocalBlob::Distributing {
+            created_at: Instant::now(),
+            blob: LocalBlob::Distributing {
                 root_hash, merkle_leaves, chunks, base_path, _admission_permit
             }
-        ));
+        });
         self.assign_chunks().await;
     }
 
@@ -134,7 +140,12 @@ impl Pipeline {
         query_id: QueryId,
         succeeded: bool
     ) {
-        let Some((local_id, local_blob)) = &mut self.local_blob else {
+        let Some(LocalBlobContext {
+            id: local_id,
+            blob: local_blob,
+            ..
+        }) = self.local_blob.as_mut()
+        else {
             return
         };
         // blob
@@ -155,7 +166,7 @@ impl Pipeline {
         if succeeded {
             debug!(blob = %local_id, "Blob is now distributed globally.");
             *local_blob = LocalBlob::Published;
-            self.archive_local_blob().await;
+            self.archive_local_blob();
         } else {
             *failed += 1;
             if *failed >= MAX_RETRIES {
@@ -163,16 +174,19 @@ impl Pipeline {
                 debug!(blob = %local_id,
                     "Max publish manifest retries reached, so blob has failed."
                 );
-                self.archive_local_blob().await;
+                self.archive_local_blob();
             }
         }
     }
 
     async fn publish_manifest(&mut self) {
-        let Some((id, LocalBlob::AwaitingPublishManifest { manifest, attempts, .. })) =
-            &mut self.local_blob
+        let Some(LocalBlobContext {
+            id,
+            blob: LocalBlob::AwaitingPublishManifest { manifest, attempts, .. },
+            ..
+        }) = self.local_blob.as_mut()
         else {
-            debug!("The local blob is not `publishing manifest`.");
+            debug!("The local blob is not publishing manifest.");
             return
         };
         let (tx_reply, rx) = oneshot::channel::<QueryId>();
@@ -215,8 +229,13 @@ impl Pipeline {
         }).await;
     }
 
-    async fn archive_local_blob(&mut self) {
-        let Some((id, _local_blob)) = self.local_blob.take() else {
+    fn archive_local_blob(&mut self) {
+        let Some(LocalBlobContext {
+            id,
+            blob: local_blob,
+            ..
+        }) = self.local_blob.take()
+        else {
             return
         };
         info!(blob = %id, "Archiving local blob.");
@@ -229,8 +248,10 @@ impl Pipeline {
             // nothing to be done
             return
         }
-        let Some((_id, LocalBlob::Distributing { chunks, base_path, .. })) =
-            self.local_blob.as_mut()
+        let Some(LocalBlobContext {
+            blob: LocalBlob::Distributing { chunks, base_path, .. },
+            ..
+        }) = self.local_blob.as_mut()
         else {
             return
         };
@@ -331,7 +352,12 @@ impl Pipeline {
         manifest: Manifest
     ) {
         let Manifest::Blob { root_hash, chunks: chunk_owners } = manifest;
-        let Some((remote_id, remote_blob)) = self.remote_blob.as_mut() else {
+        let Some(RemoteBlobContext {
+            id: remote_id,
+            blob: remote_blob,
+            ..
+        }) = self.remote_blob.as_mut()
+        else {
             debug!(blob = %id, "Unsolicited blob manifest.");
             return
         };
@@ -405,10 +431,19 @@ impl Pipeline {
     }
 
     async fn maintain_local_blob(&mut self) {
-        let Some((_, local_blob)) = &mut self.local_blob else {
+        let Some(LocalBlobContext {
+            id,
+            created_at: blob_created_at,
+            blob: local_blob
+        }) = self.local_blob.as_mut()
+        else {
             return
         };
         let now = Instant::now();
+        if now.duration_since(*blob_created_at).as_secs() > BLOB_STALE_DEADLINE {
+            self.archive_local_blob();
+            return
+        }
         match local_blob {
             LocalBlob::Distributing { chunks, .. } => {
                 for (_, chunk) in chunks.iter_mut() {
@@ -442,7 +477,7 @@ impl Pipeline {
                         > BLOB_STALE_DEADLINE
                 {
                     *local_blob = LocalBlob::Failed;
-                    self.archive_local_blob().await;
+                    self.archive_local_blob();
                     return
                 }
                 if !attempts.is_empty()
@@ -461,10 +496,19 @@ impl Pipeline {
     }
 
     async fn maintain_remote_blob(&mut self) {
-        let Some((id, remote_blob)) = self.remote_blob.as_mut() else {
+        let Some(RemoteBlobContext {
+            id,
+            created_at: blob_created_at,
+            blob: remote_blob
+        }) = self.remote_blob.as_mut()
+        else {
             return
         };
         let now = Instant::now();
+        if now.duration_since(*blob_created_at).as_secs() > BLOB_STALE_DEADLINE {
+            self.archive_remote_blob();
+            return
+        }
         match remote_blob {
             RemoteBlob::AwaitingManifest(attempts) => {
                 if !attempts.is_empty() {
@@ -606,8 +650,13 @@ impl Pipeline {
         self.check_for_new_blob_requests().await;
     }
 
-    async fn archive_remote_blob(&mut self) {
-        let Some((id, remote_blob)) = self.remote_blob.take() else {
+    fn archive_remote_blob(&mut self) {
+        let Some(RemoteBlobContext {
+            id,
+            blob: remote_blob,
+            ..
+        }) = self.remote_blob.take()
+        else {
             return
         };
         debug!(blob = %id, "Archiving remote blob.");
@@ -621,8 +670,11 @@ impl Pipeline {
         reply_tx: oneshot::Sender<Option<TransferPermit>>
     ) {
         debug!(hash = %hash.to_hex(), from = %from, "A new incoming push request.");
-        let Some((_, RemoteBlob::Gathering { chunks, .. })) = self.remote_blob.as_mut() else {
-            let _ = reply_tx.send(None);
+        let Some(RemoteBlobContext {
+            blob: RemoteBlob::Gathering { chunks, .. },
+            ..
+        }) = self.remote_blob.as_mut()
+        else {
             debug!("Remote blob is not gathering.");
             return
         };
@@ -668,15 +720,17 @@ impl Pipeline {
         ));
     }
 
-    fn handle_incoming_pull_request(
+    fn _handle_incoming_pull_request(
         &mut self,
         from: PeerId,
         hash: Hash,
         reply_tx: oneshot::Sender<Option<TransferPermit>>
     ) {
         debug!(hash = %hash.to_hex(), from = %from, "A new incoming pull request.");
-        let Some((_id, LocalBlob::Distributing { chunks, .. })) =
-            self.local_blob.as_mut()
+        let Some(LocalBlobContext {
+            blob: LocalBlob::Distributing { chunks, .. },
+            ..
+        }) = self.local_blob.as_mut()
         else {
             let _ = reply_tx.send(None);
             debug!("Local blob is not distributing.");
@@ -724,7 +778,12 @@ impl Pipeline {
         hash: Hash,
         succeeded: bool
     ) {
-        let Some((_id, local_blob)) = self.local_blob.as_mut() else {
+        let Some(LocalBlobContext {
+            blob: local_blob,
+            ..
+        }) = self.local_blob.as_mut()
+        else {
+            debug!("Local blob is not distributing.");
             return
         };
         debug!(chunk = %hash.to_hex(), from = %from, succeeded = %succeeded,
@@ -791,8 +850,10 @@ impl Pipeline {
         debug!(chunk = %hash.to_hex(), succeeded = %succeeded, from = %from,
             "A new outcome for the remote blob."
         );
-        let Some((_id, RemoteBlob::Gathering { chunks, .. })) =
-            self.remote_blob.as_mut()
+        let Some(RemoteBlobContext {
+            blob: RemoteBlob::Gathering { chunks, .. },
+            ..
+        }) = self.remote_blob.as_mut()
         else {
             debug!("Remote blob is not gathering.");
             return
@@ -816,7 +877,7 @@ impl Pipeline {
         if succeeded {
             *chunk = RemoteChunk::Pulled(from);
             if chunks.values().all(|c| matches!(c, RemoteChunk::Pulled(_))) {
-                self.archive_remote_blob().await;
+                self.archive_remote_blob();
             }
         } else {
             *failed.entry(from).or_default() += 1;
