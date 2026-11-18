@@ -13,8 +13,6 @@ pub enum Manifest {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     StoragePermit,
-    // <chunk id>
-    PullChunk(String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -23,6 +21,4 @@ pub enum Response {
     IssuedStoragePermit {
         valid_for: u64 // seconds
     },
-    // <chunk id>
-    PullChunkAck(String),
 }

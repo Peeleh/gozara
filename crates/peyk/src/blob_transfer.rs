@@ -194,7 +194,7 @@ pub fn push(
     path: PathBuf,
     permit: OwnedSemaphorePermit,
     tx_outcome: mpsc::Sender<TransferOutcome>,
-) -> Result<()> {
+) {
     let onset = Instant::now();
     tokio::spawn(async move {
         let result = timeout(
@@ -237,7 +237,6 @@ pub fn push(
             }
         }
     });
-    Ok(())
 }
 
 async fn receive_to_temp<R: AsyncRead + Unpin>(
@@ -312,7 +311,7 @@ pub fn pull(
     max_payload_len: usize,
     permit: OwnedSemaphorePermit,
     tx_outcome: mpsc::Sender<TransferOutcome>
-) -> Result<()> {
+) {
     let onset = Instant::now();
     tokio::spawn(async move {
         let result = timeout(
@@ -356,7 +355,6 @@ pub fn pull(
             }
         }
     });
-    Ok(())
 }
 
 #[derive(Debug)]

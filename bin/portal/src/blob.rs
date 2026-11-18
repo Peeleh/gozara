@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashSet, HashMap},
     path::PathBuf
 };
 use tokio::{
@@ -8,14 +8,13 @@ use tokio::{
 };
 use libp2p::{
     PeerId,
-    request_response::OutboundRequestId,
     kad::QueryId
 };
 use blake3::Hash;
 use peyk::protocol::Manifest;
 
 #[derive(Debug)]
-pub struct PullContext {
+pub struct InflightPull {
     pub from: PeerId,
     pub created_at: Instant
 }
@@ -23,9 +22,10 @@ pub struct PullContext {
 #[derive(Debug)]
 pub enum RemoteChunk {
     Pulling {
-        requests: HashMap<PeerId, Vec<(OutboundRequestId, Instant)>>,
-        context: Option<PullContext>,
-        failed: HashMap<PeerId, Vec<Instant>>,
+        path: PathBuf,
+        owners: HashSet<PeerId>,
+        inflight: Option<InflightPull>,
+        failed: HashMap<PeerId, usize>,
     },
     Pulled(PeerId),
     Failed
@@ -38,7 +38,7 @@ pub enum RemoteBlob {
     Gathering {
         root_hash: Hash,
         merkle_leaves: Vec<Hash>,
-        path: PathBuf,
+        base_path: PathBuf,
         chunks: HashMap<Hash, RemoteChunk>,
     },
     Failed

@@ -13,7 +13,6 @@ use tokio_util::sync::CancellationToken;
 use blake3::Hash;
 use libp2p::{
     PeerId,
-    request_response::OutboundRequestId,
     kad::QueryId
 };
 use sqlx::PgPool;
@@ -21,7 +20,7 @@ use crate::admission::{
     BASE_BLOB_PATH, ToPipeline, CHUNK_SIZE
 };
 use crate::blob::{
-    LocalBlob, LocalChunk, PushContext, RemoteBlob, RemoteChunk, PullContext
+    LocalBlob, LocalChunk, PushContext, RemoteBlob, RemoteChunk, InflightPull
 };
 use peyk::{
     blob_transfer,
@@ -32,7 +31,6 @@ use peyk::{
     },
     FromSwarm, ToSwarm,
     protocol::Manifest,
-    request_pull
 };
 
 // one hour
@@ -334,10 +332,10 @@ impl Pipeline {
         match remote_blob {
             RemoteBlob::AwaitingManifest(_) => {
                 // todo: validate root hash
-                let path = Path::new(BASE_BLOB_PATH).join(&id);
-                if let Err(e) = tokio::fs::create_dir_all(&path).await {
-                    warn!(blob = %id, error = %e, path = %path.display(),
-                        "Failed to create the remote blob folder."
+                let blob_path = Path::new(BASE_BLOB_PATH).join(&id);
+                if let Err(e) = tokio::fs::create_dir_all(&blob_path).await {
+                    warn!(blob = %id, error = %e, path = %blob_path.display(),
+                        "Failed to create a folder for the remote blob."
                     );
                     *remote_blob = RemoteBlob::Failed;
                     return
@@ -346,19 +344,35 @@ impl Pipeline {
                 for (plain_hash, peer) in chunk_owners.iter() {
                     let hash = Hash::from(*plain_hash);
                     let hash_str = hash.to_string();
-                    let mut requests = vec![];
-                    if let Some(req_id) = request_pull(
-                        &hash_str,
-                        *peer,
-                        self.tx_swarm.clone()
-                    ).await {
-                        requests.push((req_id, now));
-                    }
+                    let path = blob_path.as_path().join(&hash_str);
+                    let inflight = self
+                        .download_permit
+                        .clone()
+                        .try_acquire_owned()
+                        .ok()
+                        .map(|permit| {
+                            // pull it
+                            debug!(chunk = %hash_str, from = %peer, "Chunk pull is initiated.");
+                            blob_transfer::pull(
+                                self.blob_transfer_control.clone(),
+                                *peer,
+                                hash,
+                                path.clone(),
+                                CHUNK_SIZE,
+                                permit,
+                                self.tx_transfer_outcome.clone(),
+                            );
+                            InflightPull {
+                                from: *peer,
+                                created_at: Instant::now()
+                            }
+                        });
                     chunks.insert(
                         hash,
                         RemoteChunk::Pulling {
-                            requests: [(*peer, requests)].into(),
-                            context: None,
+                            path,
+                            owners: [*peer].into(),
+                            inflight,
                             failed: HashMap::new()
                         }
                     );
@@ -369,7 +383,7 @@ impl Pipeline {
                         .into_iter()
                         .map(|(h, _)| h.into())
                         .collect(),
-                    path,
+                    base_path: blob_path,
                     chunks
                 };
             }
@@ -378,77 +392,6 @@ impl Pipeline {
             }
             _ => ()
         };
-    }
-
-    async fn handle_pull_chunk_ack(
-        &mut self,
-        id: String,
-        peer: PeerId,
-        req_id: OutboundRequestId
-    ) {
-        let Some((_, RemoteBlob::Gathering { chunks, path, .. })) = &mut self.remote_blob else {
-            debug!(chunk = %id, "Unsolicited pull chunk ACK: not gathering.");
-            return
-        };
-        let Ok(hash) = Hash::from_hex(id.as_bytes()) else {
-            debug!(chunk = %id, "Pull chunk ACK hash decode failed.");
-            return
-        };
-        let Some(chunk) = chunks.get_mut(&hash) else {
-            debug!(chunk = %id, "Unsolicited pull chunk ACK: chunk not found.");
-            return
-        };
-        match chunk {
-            RemoteChunk::Pulling { requests, context, failed } => {
-                if failed.contains_key(&peer) {
-                    // todo: retry
-                    return
-                }
-                if let Some(PullContext { from: ex_peer, .. }) = context {
-                    if *ex_peer == peer {
-                        debug!(chunk = %id, from = %peer, "Pull already underway.");
-                        return
-                    }
-                }
-                let Some(reqs) = requests.get(&peer) else {
-                    debug!(chunk = %id, from = %peer, "Unsolicited pull chunk ACK.");
-                    return
-                };
-                if !reqs.iter().any(|(ex_req_id, _)| *ex_req_id == req_id) {
-                    debug!(chunk = %id, from = %peer, request_id = %req_id,
-                        "Pull chunk ACK request Ids mismatch."
-                    );
-                    return
-                }
-                let Ok(permit) = self
-                    .download_permit
-                    .clone()
-                    .try_acquire_owned()
-                else {
-                    debug!(chunk = %id, from = %peer, "No pull permit to proceed.");
-                    return
-                };
-                *context = Some(PullContext {
-                    from: peer,
-                    created_at: Instant::now()
-                });
-                // pull it
-                debug!(chunk = %id, from = %peer, "Chunk pull is initiated.");
-                let _ = blob_transfer::pull(
-                    self.blob_transfer_control.clone(),
-                    peer,
-                    hash,
-                    path.as_path().join(&hash.to_string()),
-                    CHUNK_SIZE,
-                    permit,
-                    self.tx_transfer_outcome.clone(),
-                );
-            }
-            RemoteChunk::Failed => {
-                // todo
-            }
-            _ => ()
-        }
     }
 
     async fn maintain_local_blob(&mut self) {
@@ -557,60 +500,69 @@ impl Pipeline {
                 for (hash, chunk) in chunks.iter_mut() {
                     let hash_str = hash.to_string();
                     match chunk {
-                        RemoteChunk::Pulling { requests, context, failed } => {
-                            // the active pull may fail so advance other pull requests as well
-                            let failed_reqs = requests.extract_if(|_, reqs| {
-                                if reqs.is_empty() {
-                                    return false
-                                }
-                                let (_, first_try) = reqs.first().unwrap();
-                                reqs.len() >= MAX_RETRIES
-                                || now.duration_since(*first_try).as_secs() > CHUNK_STALE_DEADLINE
-                            });
-                            for (peer, reqs) in failed_reqs.into_iter() {
-                                let attempts: Vec<_> = reqs.into_iter().map(|(_, t)| t).collect();
-                                failed
-                                    .entry(peer)
-                                    .or_default()
-                                    .extend_from_slice(attempts.as_slice());
-                            }
-                            for (peer, reqs) in requests.iter_mut() {
-                                if !reqs.is_empty() {
-                                    let (_, last_try) = reqs.last().unwrap();
-                                    if now.duration_since(*last_try).as_secs() < TIMEOUT_WINDOW {
-                                        // nothing to be done
+                        RemoteChunk::Pulling { path, owners, inflight, failed } => {
+                            if let Some(InflightPull { from, created_at }) = inflight.as_mut() {
+                                if now.duration_since(*created_at).as_secs() > TIMEOUT_WINDOW {
+                                    let attempts = failed.entry(*from).or_default();
+                                    if *attempts == MAX_RETRIES {
+                                        *chunk = RemoteChunk::Failed;
+                                        // todo: try with other peers
                                         continue
                                     }
+                                    self
+                                        .download_permit
+                                        .clone()
+                                        .try_acquire_owned()
+                                        .ok()
+                                        .map(|permit| {
+                                            // pull it again
+                                            debug!(chunk = %hash_str, from = %from,
+                                                attempt_no = %attempts,
+                                                "Chunk pull is initiated."
+                                            );
+                                            blob_transfer::pull(
+                                                self.blob_transfer_control.clone(),
+                                                *from,
+                                                *hash,
+                                                path.clone(),
+                                                CHUNK_SIZE,
+                                                permit,
+                                                self.tx_transfer_outcome.clone(),
+                                            );
+                                            *created_at = now;
+                                            *attempts += 1;
+                                        });
                                 }
-                                let Some(req_id) = request_pull(
-                                    &hash_str, *peer, self.tx_swarm.clone()
-                                ).await else {
+                                else {
+                                    // nothing to be done
                                     continue
-                                };
-                                reqs.push((req_id, now));
-                                debug!(chunk = %hash_str, remaining = MAX_RETRIES - reqs.len(),
-                                    "Sent another push request."
-                                );
-                            }
-                            if let Some(PullContext { from, created_at, .. }) = context {
-                                if now.duration_since(*created_at).as_secs() > TIMEOUT_WINDOW {
-                                    failed.entry(*from).or_default().push(Instant::now());
-                                    *context = None;
                                 }
-                            }
-                            if requests.is_empty() && !failed.is_empty() {
-                                if failed
-                                    .iter()
-                                    .all(|(_, attempts)| {
-                                        let first_try = *attempts.first().unwrap();
-                                        attempts.len() >= MAX_RETRIES
-                                        || now.duration_since(first_try).as_secs()
-                                            > CHUNK_STALE_DEADLINE
-                                    })
-                                {
-                                    *chunk = RemoteChunk::Failed;
-                                    // todo: retry
-                                }
+                            } else {
+                                let from = *owners.iter().next().unwrap();
+                                self
+                                    .download_permit
+                                    .clone()
+                                    .try_acquire_owned()
+                                    .ok()
+                                    .map(|permit| {
+                                        // pull it
+                                        debug!(chunk = %hash_str, from = %from,
+                                            "Chunk pull is initiated."
+                                        );
+                                        blob_transfer::pull(
+                                            self.blob_transfer_control.clone(),
+                                            from,
+                                            *hash,
+                                            path.clone(),
+                                            CHUNK_SIZE,
+                                            permit,
+                                            self.tx_transfer_outcome.clone(),
+                                        );
+                                        *inflight = Some(InflightPull {
+                                            from,
+                                            created_at: now
+                                        });
+                                    });
                             }
                         }
                         RemoteChunk::Failed => {
@@ -659,32 +611,31 @@ impl Pipeline {
         reply_tx: oneshot::Sender<Option<TransferPermit>>
     ) {
         debug!(hash = %hash.to_hex(), from = %from, "A new incoming push request.");
-        let Some((_, RemoteBlob::Gathering { chunks, path, .. })) = self.remote_blob.as_mut() else {
+        let Some((_, RemoteBlob::Gathering { chunks, .. })) = self.remote_blob.as_mut() else {
             let _ = reply_tx.send(None);
             debug!("Remote blob is not gathering.");
             return
         };
-        let Some(RemoteChunk::Pulling { requests, context, failed }) = chunks.get_mut(&hash) else {
+        let Some(RemoteChunk::Pulling { path, owners, inflight, failed }) =
+            chunks.get_mut(&hash)
+        else {
             let _ = reply_tx.send(None);
             debug!("Chunk is not pulling or is missing.");
             return
         };
-        if context.is_some() {
+        if inflight.is_some() {
+            // save the peer
+            let _ = owners.insert(from);
             let _ = reply_tx.send(None);
             debug!("Another pull already underway.");
             return
         }
         if let Some(attempts) = failed.get(&from) {
-            if attempts.len() >= MAX_RETRIES {
+            if *attempts >= MAX_RETRIES {
                 debug!("Max pull retries already attempted for this peer.");
                 let _ = reply_tx.send(None);
                 return
             }
-        }
-        if !requests.contains_key(&from) {
-            debug!("Unsolicited request.");
-            let _ = reply_tx.send(None);
-            return
         }
         let Ok(permit) = self
             .download_permit
@@ -695,13 +646,13 @@ impl Pipeline {
             let _ = reply_tx.send(None);
             return
         };
-        *context = Some(PullContext {
+        *inflight = Some(InflightPull {
             from,
             created_at: Instant::now()
         });
         let _ = reply_tx.send(Some(
             TransferPermit {
-                path: path.as_path().join(hash.to_string()),
+                path: path.clone(),
                 permit
             }
         ));
@@ -843,12 +794,12 @@ impl Pipeline {
             debug!("Chunk not found.");
             return
         };
-        let RemoteChunk::Pulling { requests, context, failed } = chunk else {
+        let RemoteChunk::Pulling { inflight, failed, .. } = chunk else {
             debug!("Chunk not pulling.");
             return
         };
-        let Some(PullContext { from: ex_from, .. }) = context else {
-            debug!("No pull context for the chunk.");
+        let Some(InflightPull { from: ex_from, .. }) = inflight else {
+            debug!("No active inflight pull for the chunk.");
             return
         };
         if *ex_from != from {
@@ -861,10 +812,7 @@ impl Pipeline {
                 self.archive_remote_blob().await;
             }
         } else {
-            let _ = requests.remove(&from);
-            failed.entry(from).or_default().push(Instant::now());
-            *context = None;
-            // todo: failed decision flow
+            *failed.entry(from).or_default() += 1;
         }
     }
 
@@ -958,9 +906,6 @@ pub async fn run(
                                     );
                                     // todo: storage permit is already invalid in case of overflow
                                     pipeline.assign_chunks().await;
-                                }
-                                peyk::protocol::Response::PullChunkAck(id) => {
-                                    pipeline.handle_pull_chunk_ack(id, peer, request_id).await;
                                 }
                             }
                         }

@@ -41,11 +41,6 @@ pub enum ToSwarm {
     },
     LookupManifest {
         blobs: Vec<String>
-    },
-    PullChunk {
-        id: String,
-        to: PeerId,
-        tx_reply: oneshot::Sender<OutboundRequestId>
     }
 }
 
@@ -169,16 +164,6 @@ pub async fn process_swarm(
                                     "Initiating manifest lookup."
                                 );
                             }
-                        }
-                        ToSwarm::PullChunk { id, to, tx_reply } => {
-                            let req_id = swarm
-                                .behaviour_mut()
-                                .req_resp
-                                .send_request(&to, protocol::Request::PullChunk(id.clone()));
-                            let _ = tx_reply.send(req_id);
-                            debug!(chunk = %id, from = %to, req_id = %req_id,
-                                "Requested chunk pull."
-                            );
                         }
                     }
                     None => {
@@ -357,28 +342,4 @@ pub async fn process_swarm(
         }
     });
     Ok(jh)
-}
-
-pub async fn request_pull(
-    id: &str,
-    to: PeerId,
-    tx: mpsc::Sender<ToSwarm>
-) -> Option<OutboundRequestId> {
-    let (tx_reply, rx) = oneshot::channel::<OutboundRequestId>();
-    if let Err(e) = tx.send(ToSwarm::PullChunk {
-        id: id.to_owned(), to, tx_reply
-    }).await {
-        warn!(chunk = %id, error = %e,
-            "Failed to send the `pull chunk` to the Swarm channel."
-        );
-        return None
-    }
-    let req_id = match rx.await {
-        Ok(r) => r,
-        Err(_) => {
-            warn!("Request pull reply channel is closed.");
-            return None
-        }
-    };
-    Some(req_id)
 }
