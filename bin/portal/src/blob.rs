@@ -34,7 +34,6 @@ pub enum RemoteChunk {
 
 #[derive(Debug)]
 pub enum RemoteBlob {
-    // todo: entry time for timeouts
     AwaitingManifest(Vec<Instant>),
     Gathering {
         root_hash: Hash,
@@ -66,7 +65,8 @@ pub enum LocalChunk {
         failed: HashMap<PeerId, usize>,
     },
     // <owner>
-    Pushed(PeerId)
+    Pushed(PeerId),
+    Failed
 }
 
 impl LocalChunk {

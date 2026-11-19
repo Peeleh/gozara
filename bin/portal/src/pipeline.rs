@@ -131,7 +131,7 @@ impl Pipeline {
                 root_hash, merkle_leaves, chunks, base_path, _admission_permit
             }
         });
-        self.assign_chunks().await;
+        self.assign_chunks();
     }
 
     async fn handle_publish_manifest_result(
@@ -242,7 +242,7 @@ impl Pipeline {
         // todo: archival
     }
 
-    async fn assign_chunks(&mut self) {
+    fn assign_chunks(&mut self) {
         let num_available_permits = self.upload_permit.available_permits();
         if num_available_permits == 0 {
             // nothing to be done
@@ -339,7 +339,7 @@ impl Pipeline {
                 self.blob_transfer_control.clone(),
                 chosen_peer,
                 *hash,
-                path.as_path().join(&hash_str),
+                path.clone(),
                 permit,
                 self.tx_transfer_outcome.clone(),
             );
@@ -449,9 +449,15 @@ impl Pipeline {
                 for (_, chunk) in chunks.iter_mut() {
                     match chunk {
                         LocalChunk::Assigned { inflight, failed, .. } => {
+                            // capture incoming pull timeout
                             if let Some(InflightPush { to, created_at }) = inflight {
                                 if now.duration_since(*created_at).as_secs() > TIMEOUT_WINDOW {
                                     *failed.entry(*to).or_default() += 1;
+                                    let attempts = *failed.entry(*to).or_default();
+                                    if attempts >= MAX_RETRIES {
+                                        *chunk = LocalChunk::Failed;
+                                        return
+                                    }
                                     *inflight = None;
                                 }
                             }
@@ -459,15 +465,7 @@ impl Pipeline {
                         _ => ()
                     };
                 }
-                // todo: need blob's entry time to decide if it should be marked as failed
-                if self.upload_permit.available_permits() == 0usize {
-                    return
-                }
-                if chunks.iter().any(|(_, chunk)|
-                    matches!(chunk, LocalChunk::AwaitingAssignment | LocalChunk::Assigned { .. })
-                ) {
-                    self.assign_chunks().await;
-                }
+                self.assign_chunks();
             }
             LocalBlob::AwaitingPublishManifest { attempts, .. } => {
                 if !attempts.is_empty()
@@ -506,6 +504,7 @@ impl Pipeline {
         };
         let now = Instant::now();
         if now.duration_since(*blob_created_at).as_secs() > BLOB_STALE_DEADLINE {
+            *remote_blob = RemoteBlob::Failed;
             self.archive_remote_blob();
             return
         }
@@ -515,7 +514,7 @@ impl Pipeline {
                     if now
                         .duration_since(*attempts.first().unwrap())
                         .as_secs()
-                        > BLOB_STALE_DEADLINE
+                        > CHUNK_STALE_DEADLINE
                     {
                         warn!(blob = %id, "Cannot request more manifest lookups: timeout reached.");
                         *remote_blob = RemoteBlob::Failed;
@@ -556,9 +555,11 @@ impl Pipeline {
                     match chunk {
                         RemoteChunk::Pulling { path, owners, inflight, failed } => {
                             if let Some(InflightPull { from, created_at }) = inflight.as_mut() {
+                                // capture incoming push timeout
                                 if now.duration_since(*created_at).as_secs() > TIMEOUT_WINDOW {
-                                    let attempts = failed.entry(*from).or_default();
-                                    if *attempts == MAX_RETRIES {
+                                    *failed.entry(*from).or_default() += 1;
+                                    let attempts = *failed.entry(*from).or_default();
+                                    if attempts >= MAX_RETRIES {
                                         *chunk = RemoteChunk::Failed;
                                         // todo: try with other peers
                                         continue
@@ -584,7 +585,6 @@ impl Pipeline {
                                                 self.tx_transfer_outcome.clone(),
                                             );
                                             *created_at = now;
-                                            *attempts += 1;
                                         });
                                 }
                                 else {
@@ -685,9 +685,9 @@ impl Pipeline {
             debug!("Chunk is not pulling or is missing.");
             return
         };
+        let _ = owners.insert(from);
         if inflight.is_some() {
             // save the peer
-            let _ = owners.insert(from);
             let _ = reply_tx.send(None);
             debug!("Another pull already underway.");
             return
@@ -881,6 +881,7 @@ impl Pipeline {
             }
         } else {
             *failed.entry(from).or_default() += 1;
+            *inflight = None;
         }
     }
 
@@ -892,10 +893,14 @@ impl Pipeline {
         succeeded: bool
     ) {
         match direction {
-            Direction::Pull =>
-                self.handle_transfer_outcome_for_local_blob(from, hash, succeeded).await,
-            Direction::Push =>
-                self.handle_transfer_outcome_for_remote_blob(from, hash, succeeded).await
+            Direction::Pull => {
+                self.handle_transfer_outcome_for_local_blob(from, hash, succeeded).await;
+                self.maintain_local_blob().await;
+            }
+            Direction::Push => {
+                self.handle_transfer_outcome_for_remote_blob(from, hash, succeeded).await;
+                self.maintain_remote_blob().await;
+            }
         }
     }
 
@@ -907,10 +912,14 @@ impl Pipeline {
         succeeded: bool
     ) {
         match direction {
-            Direction::Pull =>
-                self.handle_transfer_outcome_for_remote_blob(from, hash, succeeded).await,
-            Direction::Push =>
-                self.handle_transfer_outcome_for_local_blob(from, hash, succeeded).await
+            Direction::Pull => {
+                self.handle_transfer_outcome_for_remote_blob(from, hash, succeeded).await;
+                self.maintain_remote_blob().await;
+            }
+            Direction::Push => {
+                self.handle_transfer_outcome_for_local_blob(from, hash, succeeded).await;
+                self.maintain_local_blob().await;
+            }
         }
     }
 }
@@ -973,7 +982,7 @@ pub async fn run(
                                         .unwrap_or(now)
                                     );
                                     // todo: storage permit is already invalid in case of overflow
-                                    pipeline.assign_chunks().await;
+                                    pipeline.assign_chunks();
                                 }
                             }
                         }
