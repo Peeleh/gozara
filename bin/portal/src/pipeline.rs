@@ -25,11 +25,7 @@ use crate::blob::{
 };
 use peyk::{
     blob_transfer,
-    blob_transfer::{
-        Direction, TransferPermit, IncomingTransfer, TransferOutcome, Outcome,
-        PUSH_PROTOCOL, PULL_PROTOCOL,
-        TIMEOUT_WINDOW
-    },
+    blob_transfer::{Direction, TransferOutcome, Outcome, TIMEOUT_WINDOW},
     FromSwarm, ToSwarm,
     protocol::Manifest,
 };
@@ -232,7 +228,6 @@ impl Pipeline {
     fn archive_local_blob(&mut self) {
         let Some(LocalBlobContext {
             id,
-            blob: local_blob,
             ..
         }) = self.local_blob.take()
         else {
@@ -304,13 +299,13 @@ impl Pipeline {
                 };
                 *peer
             };
-            let hash_str = hash.to_string();
+            let hash_hex = hash.to_hex();
             let Ok(permit) = self
                 .upload_permit
                 .clone()
                 .try_acquire_owned()
             else {
-                debug!(to = %chosen_peer, hash = %hash_str,
+                debug!(to = %chosen_peer, hash = %hash_hex,
                     "Could not get an upload permit for transfer."
                 );
                 break
@@ -318,7 +313,7 @@ impl Pipeline {
             let now = Instant::now();
             let (path, failed) = match chunk {
                 LocalChunk::AwaitingAssignment => (
-                    base_path.as_path().join(&hash_str),
+                    base_path.as_path().join(hash_hex.as_str()),
                     HashMap::new()
                 ),
                 LocalChunk::Assigned { path, failed, .. } => (path.clone(), failed.clone()),
@@ -334,8 +329,8 @@ impl Pipeline {
                 failed
             };
             // push it
-            debug!(chunk = %hash_str, to = %chosen_peer, "Chunk push is initiated.");
-            let _ = blob_transfer::push(
+            debug!(chunk = %hash_hex, to = %chosen_peer, "Chunk push is initiated.");
+            blob_transfer::push(
                 self.blob_transfer_control.clone(),
                 chosen_peer,
                 *hash,
@@ -374,45 +369,24 @@ impl Pipeline {
                         "Failed to create a folder for the remote blob."
                     );
                     *remote_blob = RemoteBlob::Failed;
+                    // todo: failing here is cruel
                     return
                 }
-                let mut chunks = HashMap::new();
-                for (plain_hash, peer) in chunk_owners.iter() {
-                    let hash = Hash::from(*plain_hash);
-                    let hash_str = hash.to_string();
-                    let path = blob_path.as_path().join(&hash_str);
-                    let inflight = self
-                        .download_permit
-                        .clone()
-                        .try_acquire_owned()
-                        .ok()
-                        .map(|permit| {
-                            // pull it
-                            debug!(chunk = %hash_str, from = %peer, "Chunk pull is initiated.");
-                            blob_transfer::pull(
-                                self.blob_transfer_control.clone(),
-                                *peer,
-                                hash,
-                                path.clone(),
-                                CHUNK_SIZE,
-                                permit,
-                                self.tx_transfer_outcome.clone(),
-                            );
-                            InflightPull {
-                                from: *peer,
-                                created_at: Instant::now()
+                let chunks: HashMap<Hash, RemoteChunk> = chunk_owners
+                    .iter()
+                    .map(|(plain_hash, peer)| {
+                        let hash = Hash::from(*plain_hash);
+                        (
+                            hash,
+                            RemoteChunk::Pulling {
+                                path: blob_path.as_path().join(hash.to_hex().as_str()),
+                                owners: [*peer].into(),
+                                inflight: None,
+                                failed: HashMap::new()
                             }
-                        });
-                    chunks.insert(
-                        hash,
-                        RemoteChunk::Pulling {
-                            path,
-                            owners: [*peer].into(),
-                            inflight,
-                            failed: HashMap::new()
-                        }
-                    );
-                }
+                        )
+                    })
+                    .collect();
                 *remote_blob = RemoteBlob::Gathering {
                     root_hash: root_hash.into(),
                     merkle_leaves: chunk_owners
@@ -432,39 +406,21 @@ impl Pipeline {
 
     async fn maintain_local_blob(&mut self) {
         let Some(LocalBlobContext {
-            id,
             created_at: blob_created_at,
-            blob: local_blob
+            blob: local_blob,
+            ..
         }) = self.local_blob.as_mut()
         else {
             return
         };
         let now = Instant::now();
         if now.duration_since(*blob_created_at).as_secs() > BLOB_STALE_DEADLINE {
+            *local_blob = LocalBlob::Failed;
             self.archive_local_blob();
             return
         }
         match local_blob {
-            LocalBlob::Distributing { chunks, .. } => {
-                for (_, chunk) in chunks.iter_mut() {
-                    match chunk {
-                        LocalChunk::Assigned { inflight, failed, .. } => {
-                            // capture incoming pull timeout
-                            if let Some(InflightPush { to, created_at }) = inflight {
-                                if now.duration_since(*created_at).as_secs() > TIMEOUT_WINDOW {
-                                    *failed.entry(*to).or_default() += 1;
-                                    let attempts = *failed.entry(*to).or_default();
-                                    if attempts >= MAX_RETRIES {
-                                        *chunk = LocalChunk::Failed;
-                                        return
-                                    }
-                                    *inflight = None;
-                                }
-                            }
-                        }
-                        _ => ()
-                    };
-                }
+            LocalBlob::Distributing { .. } => {
                 self.assign_chunks();
             }
             LocalBlob::AwaitingPublishManifest { attempts, .. } => {
@@ -554,70 +510,52 @@ impl Pipeline {
                     let hash_str = hash.to_string();
                     match chunk {
                         RemoteChunk::Pulling { path, owners, inflight, failed } => {
-                            if let Some(InflightPull { from, created_at }) = inflight.as_mut() {
-                                // capture incoming push timeout
-                                if now.duration_since(*created_at).as_secs() > TIMEOUT_WINDOW {
-                                    *failed.entry(*from).or_default() += 1;
-                                    let attempts = *failed.entry(*from).or_default();
-                                    if attempts >= MAX_RETRIES {
-                                        *chunk = RemoteChunk::Failed;
-                                        // todo: try with other peers
-                                        continue
-                                    }
-                                    self
-                                        .download_permit
-                                        .clone()
-                                        .try_acquire_owned()
-                                        .ok()
-                                        .map(|permit| {
-                                            // pull it again
-                                            debug!(chunk = %hash_str, from = %from,
-                                                attempt_no = %attempts,
-                                                "Chunk pull is initiated."
-                                            );
-                                            blob_transfer::pull(
-                                                self.blob_transfer_control.clone(),
-                                                *from,
-                                                *hash,
-                                                path.clone(),
-                                                CHUNK_SIZE,
-                                                permit,
-                                                self.tx_transfer_outcome.clone(),
-                                            );
-                                            *created_at = now;
-                                        });
-                                }
-                                else {
-                                    // nothing to be done
-                                    continue
-                                }
-                            } else {
-                                let from = *owners.iter().next().unwrap();
-                                self
-                                    .download_permit
-                                    .clone()
-                                    .try_acquire_owned()
-                                    .ok()
-                                    .map(|permit| {
-                                        // pull it
-                                        debug!(chunk = %hash_str, from = %from,
-                                            "Chunk pull is initiated."
-                                        );
-                                        blob_transfer::pull(
-                                            self.blob_transfer_control.clone(),
-                                            from,
-                                            *hash,
-                                            path.clone(),
-                                            CHUNK_SIZE,
-                                            permit,
-                                            self.tx_transfer_outcome.clone(),
-                                        );
-                                        *inflight = Some(InflightPull {
-                                            from,
-                                            created_at: now
-                                        });
-                                    });
+                            if inflight.is_some() {
+                                continue
                             }
+                            let Ok(permit) = self
+                                .download_permit
+                                .clone()
+                                .try_acquire_owned()
+                            else {
+                                continue
+                            };
+                            let mut eligible_peers: Vec<(PeerId, usize)> = owners
+                                .iter()
+                                .filter_map(|peer| {
+                                    let attempts = failed
+                                        .get(peer)
+                                        .copied()
+                                        .unwrap_or_default();
+                                    if attempts < MAX_RETRIES {
+                                        Some((*peer, attempts))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            eligible_peers.sort_by(|x, y| x.1.cmp(&y.1));
+                            let Some((peer, attempts)) = eligible_peers.first() else {
+                                *chunk = RemoteChunk::Failed;
+                                continue
+                            };
+                            *inflight = Some(InflightPull {
+                                from: *peer,
+                                created_at: now
+                            });
+                            // pull it
+                            blob_transfer::pull(
+                                self.blob_transfer_control.clone(),
+                                *peer,
+                                *hash,
+                                path.clone(),
+                                CHUNK_SIZE,
+                                permit,
+                                self.tx_transfer_outcome.clone(),
+                            );
+                            debug!(chunk = %hash_str, from = %peer, attempt_no = %attempts,
+                                "Chunk pull is initiated."
+                            );
                         }
                         RemoteChunk::Failed => {
                             // todo
@@ -625,6 +563,7 @@ impl Pipeline {
                         _ => (),
                     };
                 }
+                // todo: wait for inflight pulls to finish
                 if chunks.values().any(|c| matches!(c, RemoteChunk::Failed)) {
                     *remote_blob = RemoteBlob::Failed;
                 }
@@ -653,7 +592,6 @@ impl Pipeline {
     fn archive_remote_blob(&mut self) {
         let Some(RemoteBlobContext {
             id,
-            blob: remote_blob,
             ..
         }) = self.remote_blob.take()
         else {
@@ -661,115 +599,6 @@ impl Pipeline {
         };
         debug!(blob = %id, "Archiving remote blob.");
         // todo: archival
-    }
-
-    fn handle_incoming_push_request(
-        &mut self,
-        from: PeerId,
-        hash: Hash,
-        reply_tx: oneshot::Sender<Option<TransferPermit>>
-    ) {
-        debug!(hash = %hash.to_hex(), from = %from, "A new incoming push request.");
-        let Some(RemoteBlobContext {
-            blob: RemoteBlob::Gathering { chunks, .. },
-            ..
-        }) = self.remote_blob.as_mut()
-        else {
-            debug!("Remote blob is not gathering.");
-            return
-        };
-        let Some(RemoteChunk::Pulling { path, owners, inflight, failed }) =
-            chunks.get_mut(&hash)
-        else {
-            let _ = reply_tx.send(None);
-            debug!("Chunk is not pulling or is missing.");
-            return
-        };
-        let _ = owners.insert(from);
-        if inflight.is_some() {
-            // save the peer
-            let _ = reply_tx.send(None);
-            debug!("Another pull already underway.");
-            return
-        }
-        if let Some(attempts) = failed.get(&from) {
-            if *attempts >= MAX_RETRIES {
-                debug!("Max pull retries already attempted for this peer.");
-                let _ = reply_tx.send(None);
-                return
-            }
-        }
-        let Ok(permit) = self
-            .download_permit
-            .clone()
-            .try_acquire_owned()
-        else {
-            debug!(hash = %hash.to_hex(), from = %from, "Could not obtain a pull permit.");
-            let _ = reply_tx.send(None);
-            return
-        };
-        *inflight = Some(InflightPull {
-            from,
-            created_at: Instant::now()
-        });
-        let _ = reply_tx.send(Some(
-            TransferPermit {
-                path: path.clone(),
-                permit
-            }
-        ));
-    }
-
-    fn _handle_incoming_pull_request(
-        &mut self,
-        from: PeerId,
-        hash: Hash,
-        reply_tx: oneshot::Sender<Option<TransferPermit>>
-    ) {
-        debug!(hash = %hash.to_hex(), from = %from, "A new incoming pull request.");
-        let Some(LocalBlobContext {
-            blob: LocalBlob::Distributing { chunks, .. },
-            ..
-        }) = self.local_blob.as_mut()
-        else {
-            let _ = reply_tx.send(None);
-            debug!("Local blob is not distributing.");
-            return
-        };
-        let Some(LocalChunk::Assigned { path, inflight, failed, .. }) = chunks.get_mut(&hash) else {
-            let _ = reply_tx.send(None);
-            debug!("Chunk is not assigned or is missing.");
-            return
-        };
-        if inflight.is_some() {
-            let _ = reply_tx.send(None);
-            debug!("Another pull is already underway.");
-            return
-        }
-        if failed.get(&from).copied().unwrap_or_default() >= MAX_RETRIES {
-            debug!("Max push retries already attempted for this peer.");
-            let _ = reply_tx.send(None);
-            return
-        }
-        let Ok(permit) = self
-            .upload_permit
-            .clone()
-            .try_acquire_owned()
-        else {
-            debug!("Could not obtain a push permit.");
-            let _ = reply_tx.send(None);
-            return
-        };
-        *inflight = Some(InflightPush {
-            to: from,
-            created_at: Instant::now()
-        });
-        let _ = reply_tx.send(Some(
-            TransferPermit {
-                path: path.clone(),
-                permit
-            }
-        ));
     }
 
     async fn handle_transfer_outcome_for_local_blob(
@@ -783,7 +612,7 @@ impl Pipeline {
             ..
         }) = self.local_blob.as_mut()
         else {
-            debug!("Local blob is not distributing.");
+            debug!("No Local blob.");
             return
         };
         debug!(chunk = %hash.to_hex(), from = %from, succeeded = %succeeded,
@@ -836,8 +665,16 @@ impl Pipeline {
                 self.publish_manifest().await;
             }
         } else {
-            *failed.entry(from).or_default() += 1;
+            let attempts = failed.entry(from).or_default();
+            *attempts += 1;
             *inflight = None;
+            if *attempts >= MAX_RETRIES {
+                *chunk = LocalChunk::Failed;
+                // todo: wait for inflight pushes to finish
+                if chunks.values().any(|c| matches!(c, LocalChunk::Failed)) {
+                    *local_blob = LocalBlob::Failed;
+                }
+            }
         }
     }
 
@@ -847,14 +684,18 @@ impl Pipeline {
         hash: Hash,
         succeeded: bool
     ) {
-        debug!(chunk = %hash.to_hex(), succeeded = %succeeded, from = %from,
-            "A new outcome for the remote blob."
-        );
         let Some(RemoteBlobContext {
-            blob: RemoteBlob::Gathering { chunks, .. },
+            blob: remote_blob,
             ..
         }) = self.remote_blob.as_mut()
         else {
+            debug!("No Remote blob.");
+            return
+        };
+        debug!(chunk = %hash.to_hex(), succeeded = %succeeded, from = %from,
+            "A new outcome for the remote blob."
+        );
+        let RemoteBlob::Gathering { chunks, .. } = remote_blob else {
             debug!("Remote blob is not gathering.");
             return
         };
@@ -880,31 +721,21 @@ impl Pipeline {
                 self.archive_remote_blob();
             }
         } else {
-            *failed.entry(from).or_default() += 1;
+            let attempts = failed.entry(from).or_default();
+            *attempts += 1;
+            if *attempts >= MAX_RETRIES {
+                *chunk = RemoteChunk::Failed;
+                return
+            }
             *inflight = None;
-        }
-    }
-
-    async fn handle_incoming_transfer_outcome(
-        &mut self,
-        from: PeerId,
-        hash: Hash,
-        direction: Direction,
-        succeeded: bool
-    ) {
-        match direction {
-            Direction::Pull => {
-                self.handle_transfer_outcome_for_local_blob(from, hash, succeeded).await;
-                self.maintain_local_blob().await;
-            }
-            Direction::Push => {
-                self.handle_transfer_outcome_for_remote_blob(from, hash, succeeded).await;
-                self.maintain_remote_blob().await;
+            // todo: wait for inflight pulls to finish
+            if chunks.values().any(|c| matches!(c, RemoteChunk::Failed)) {
+                *remote_blob = RemoteBlob::Failed;
             }
         }
     }
 
-    async fn handle_outgoing_transfer_outcome(
+    async fn handle_transfer_outcome(
         &mut self,
         from: PeerId,
         hash: Hash,
@@ -929,23 +760,11 @@ pub async fn run(
     mut rx_admission: mpsc::Receiver<ToPipeline>,
     mut rx_handler: mpsc::Receiver<FromSwarm>,
     tx_swarm: mpsc::Sender<ToSwarm>,
-    mut blob_transfer_control: peyk::Control,
+    blob_transfer_control: peyk::Control,
     shutdown: CancellationToken
 ) -> Result<tokio::task::JoinHandle<()>> {
     //  setup blob transfer
-    let (tx_incoming_transfer, mut rx_incoming_transfer) = mpsc::channel(128);
     let (tx_transfer_outcome, mut rx_transfer_outcome) = mpsc::channel(256);
-    blob_transfer::accept_pushes(
-        blob_transfer_control.accept(PUSH_PROTOCOL)?,
-        CHUNK_SIZE,
-        tx_incoming_transfer.clone(),
-        tx_transfer_outcome.clone()
-    );
-    blob_transfer::accept_pulls(
-        blob_transfer_control.accept(PULL_PROTOCOL)?,
-        tx_incoming_transfer,
-        tx_transfer_outcome.clone()
-    );
     let mut pipeline = Pipeline::new(
         db_pool,
         tx_swarm,
@@ -993,6 +812,7 @@ pub async fn run(
                         }
                         FromSwarm::ManifestIsReady { id, manifest } => {
                             pipeline.handle_manifest(id, manifest).await;
+                            pipeline.maintain_remote_blob().await;
                         }
                     }
                     None => {
@@ -1023,31 +843,17 @@ pub async fn run(
                     }
                 },
                 // <blob transfer>
-                // incoming transfers
-                r = rx_incoming_transfer.recv() => match r {
-                    Some(IncomingTransfer { from, hash, direction, reply_tx }) => match direction {
-                        Direction::Pull => (), // assing_chunks handles this
-                        Direction::Push => {
-                            pipeline.handle_incoming_push_request(from, hash, reply_tx);
-                        }
-                    },
-                    None => {
-                        break
-                    }
-                },
                 // outcomes
                 o = rx_transfer_outcome.recv() => match o {
                     Some(outcome) => match outcome {
-                        TransferOutcome::Incoming(Outcome { peer, hash, direction, succeeded }) => {
-                            pipeline.handle_incoming_transfer_outcome(
+                        TransferOutcome::Outgoing(
+                            Outcome { peer, hash, direction, succeeded }
+                        ) => {
+                            pipeline.handle_transfer_outcome(
                                 peer, hash, direction, succeeded
                             ).await;
                         }
-                        TransferOutcome::Outgoing(Outcome { peer, hash, direction, succeeded }) => {
-                            pipeline.handle_outgoing_transfer_outcome(
-                                peer, hash, direction, succeeded
-                            ).await;
-                        }
+                        _ => ()
                     }
                     None => {
                         break
