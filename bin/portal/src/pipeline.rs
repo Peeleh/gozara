@@ -261,15 +261,10 @@ impl Pipeline {
             warn!("No eligible peers to assign.");
             return
         }
-        let is_eligible = |lc: &LocalChunk, peers: &[PeerId]| match lc {
+        let is_chunk_eligible = |lc: &LocalChunk, peers: &[PeerId]| match lc {
             LocalChunk::AwaitingAssignment => true,
             LocalChunk::Assigned { inflight, failed, .. }  => {
-                let has_timed_out = if let Some(InflightPush { created_at, .. }) = inflight {
-                    now.duration_since(*created_at).as_secs() > TIMEOUT_WINDOW
-                } else {
-                    true
-                };
-                has_timed_out
+                inflight.is_none()
                 && peers
                     .iter()
                     .any(|peer| failed.get(peer).copied().unwrap_or_default() < MAX_RETRIES)
@@ -278,26 +273,28 @@ impl Pipeline {
         };
         for (hash, chunk) in chunks
             .iter_mut()
-            .filter(|(_, c)| is_eligible(c, &peers))
+            .filter(|(_, c)| is_chunk_eligible(c, &peers))
             .take(num_available_permits)
         {
-            let mut eligible_peers = peers.clone();
-            eligible_peers.retain(|peer| match chunk {
-                LocalChunk::AwaitingAssignment => true,
-                LocalChunk::Assigned { failed, .. } => {
-                    *failed.entry(*peer).or_default() < MAX_RETRIES
-                }
-                _ => false
-            });
+            let assignable_peers: Vec<_> = peers
+                .iter()
+                .filter(|peer| match chunk {
+                    LocalChunk::AwaitingAssignment => true,
+                    LocalChunk::Assigned { failed, .. } => {
+                        failed.get(peer).copied().unwrap_or_default() < MAX_RETRIES
+                    }
+                    _ => false
+                })
+                .collect();
             // todo: peer selection strategy(fastest, most reliable, ...)
             let chosen_peer = {
                 let mut rng = rand::rng();
                 use rand::seq::IndexedRandom;
-                let Some(peer) = eligible_peers.choose(&mut rng) else {
+                let Some(peer) = assignable_peers.choose(&mut rng) else {
                     warn!("Could not choose a peer: IndexedRandom misbehaved.");
                     continue
                 };
-                *peer
+                **peer
             };
             let hash_hex = hash.to_hex();
             let Ok(permit) = self
@@ -829,7 +826,7 @@ pub async fn run(
                         }
                         // local blob: chunk and distribute
                         ToPipeline::DistributeBlob {
-                            id, root_hash, merkle_leaves, admission_permit, ..
+                            id, root_hash, merkle_leaves, admission_permit
                         } => {
                             // todo: request storage permits
                             pipeline.add_local_blob(
