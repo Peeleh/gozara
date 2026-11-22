@@ -474,6 +474,7 @@ impl Pipeline {
                     {
                         warn!(blob = %id, "Cannot request more manifest lookups: timeout reached.");
                         *remote_blob = RemoteBlob::Failed;
+                        self.archive_remote_blob();
                         return
                     }
                     if now
@@ -490,6 +491,7 @@ impl Pipeline {
                         "Cannot request more manifest lookups: max retries attempted."
                     );
                     *remote_blob = RemoteBlob::Failed;
+                    self.archive_remote_blob();
                     return
                 }
                 if let Err(e) = self.tx_swarm.send(ToSwarm::LookupManifest {
@@ -566,6 +568,7 @@ impl Pipeline {
                 // todo: wait for inflight pulls to finish
                 if chunks.values().any(|c| matches!(c, RemoteChunk::Failed)) {
                     *remote_blob = RemoteBlob::Failed;
+                    self.archive_remote_blob();
                 }
             },
             RemoteBlob::Failed => {
@@ -670,10 +673,9 @@ impl Pipeline {
             *inflight = None;
             if *attempts >= MAX_RETRIES {
                 *chunk = LocalChunk::Failed;
-                // todo: wait for inflight pushes to finish
-                if chunks.values().any(|c| matches!(c, LocalChunk::Failed)) {
-                    *local_blob = LocalBlob::Failed;
-                }
+                // todo: wait for all inflight pushes to finish
+                *local_blob = LocalBlob::Failed;
+                self.archive_local_blob();
             }
         }
     }
@@ -723,14 +725,12 @@ impl Pipeline {
         } else {
             let attempts = failed.entry(from).or_default();
             *attempts += 1;
+            *inflight = None;
             if *attempts >= MAX_RETRIES {
                 *chunk = RemoteChunk::Failed;
-                return
-            }
-            *inflight = None;
-            // todo: wait for inflight pulls to finish
-            if chunks.values().any(|c| matches!(c, RemoteChunk::Failed)) {
+                // todo: wait for all inflight pulls to finish
                 *remote_blob = RemoteBlob::Failed;
+                self.archive_remote_blob();
             }
         }
     }
