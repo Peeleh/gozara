@@ -258,7 +258,7 @@ impl Pipeline {
             .map(|(peer, _)| *peer)
             .collect();
         if peers.is_empty() {
-            warn!("No eligible peers to assign.");
+            warn!("No eligible peers to assign chunks.");
             return
         }
         let is_chunk_eligible = |lc: &LocalChunk, peers: &[PeerId]| match lc {
@@ -417,9 +417,7 @@ impl Pipeline {
             return
         }
         match local_blob {
-            LocalBlob::Distributing { .. } => {
-                self.assign_chunks();
-            }
+            LocalBlob::Distributing { .. } => self.assign_chunks(),
             LocalBlob::AwaitingPublishManifest { attempts, .. } => {
                 if !attempts.is_empty()
                     && now
@@ -506,7 +504,6 @@ impl Pipeline {
             },
             RemoteBlob::Gathering { chunks, .. } => {
                 for (hash, chunk) in chunks.iter_mut() {
-                    let hash_str = hash.to_string();
                     match chunk {
                         RemoteChunk::Pulling { path, owners, inflight, failed } => {
                             if inflight.is_some() {
@@ -519,7 +516,7 @@ impl Pipeline {
                             else {
                                 continue
                             };
-                            let mut eligible_peers: Vec<(PeerId, usize)> = owners
+                            let Some((peer, attempts)) = owners
                                 .iter()
                                 .filter_map(|peer| {
                                     let attempts = failed
@@ -532,27 +529,29 @@ impl Pipeline {
                                         None
                                     }
                                 })
-                                .collect();
-                            eligible_peers.sort_by(|x, y| x.1.cmp(&y.1));
-                            let Some((peer, attempts)) = eligible_peers.first() else {
+                                .min_by(|x, y| x.1.cmp(&y.1))
+                            else {
                                 *chunk = RemoteChunk::Failed;
-                                continue
+                                // todo: too early a fail
+                                *remote_blob = RemoteBlob::Failed;
+                                self.archive_remote_blob();
+                                return
                             };
                             *inflight = Some(InflightPull {
-                                from: *peer,
+                                from: peer,
                                 created_at: now
                             });
                             // pull it
                             blob_transfer::pull(
                                 self.blob_transfer_control.clone(),
-                                *peer,
+                                peer,
                                 *hash,
                                 path.clone(),
                                 CHUNK_SIZE,
                                 permit,
                                 self.tx_transfer_outcome.clone(),
                             );
-                            debug!(chunk = %hash_str, from = %peer, attempt_no = %attempts,
+                            debug!(chunk = %hash.to_hex(), from = %peer, attempt_no = %attempts,
                                 "Chunk pull is initiated."
                             );
                         }
