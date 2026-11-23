@@ -42,7 +42,7 @@ const MAX_RETRIES: usize = 5;
 const BLOB_STALE_DEADLINE: u64 = 30 * 60;
 
 // 5 minutes before a chunk is marked as failed
-const CHUNK_STALE_DEADLINE: u64 = 5 * 60;
+const MANIFEST_LOOKUP_DEADLINE: u64 = 5 * 60;
 
 struct Pipeline {
     db_pool: PgPool,
@@ -261,7 +261,7 @@ impl Pipeline {
             warn!("No eligible peers to assign chunks.");
             return
         }
-        let is_chunk_eligible = |lc: &LocalChunk, peers: &[PeerId]| match lc {
+        let is_eligible = |lc: &LocalChunk, peers: &[PeerId]| match lc {
             LocalChunk::AwaitingAssignment => true,
             LocalChunk::Assigned { inflight, failed, .. }  => {
                 inflight.is_none()
@@ -273,18 +273,12 @@ impl Pipeline {
         };
         for (hash, chunk) in chunks
             .iter_mut()
-            .filter(|(_, c)| is_chunk_eligible(c, &peers))
+            .filter(|(_, c)| is_eligible(c, &peers))
             .take(num_available_permits)
         {
             let assignable_peers: Vec<_> = peers
                 .iter()
-                .filter(|peer| match chunk {
-                    LocalChunk::AwaitingAssignment => true,
-                    LocalChunk::Assigned { failed, .. } => {
-                        failed.get(peer).copied().unwrap_or_default() < MAX_RETRIES
-                    }
-                    _ => false
-                })
+                .filter(|peer| is_eligible(chunk, &[**peer]))
                 .collect();
             // todo: peer selection strategy(fastest, most reliable, ...)
             let chosen_peer = {
@@ -307,7 +301,6 @@ impl Pipeline {
                 );
                 break
             };
-            let now = Instant::now();
             let (path, failed) = match chunk {
                 LocalChunk::AwaitingAssignment => (
                     base_path.as_path().join(hash_hex.as_str()),
@@ -465,7 +458,7 @@ impl Pipeline {
                     if now
                         .duration_since(*attempts.first().unwrap())
                         .as_secs()
-                        > CHUNK_STALE_DEADLINE
+                        > MANIFEST_LOOKUP_DEADLINE
                     {
                         warn!(blob = %id, "Cannot request more manifest lookups: timeout reached.");
                         *remote_blob = RemoteBlob::Failed;
@@ -529,7 +522,7 @@ impl Pipeline {
                                         None
                                     }
                                 })
-                                .min_by(|x, y| x.1.cmp(&y.1))
+                                .min_by_key(|x| x.1)
                             else {
                                 *chunk = RemoteChunk::Failed;
                                 // todo: too early a fail
@@ -611,7 +604,7 @@ impl Pipeline {
             ..
         }) = self.local_blob.as_mut()
         else {
-            debug!("No Local blob.");
+            debug!("No local blob.");
             return
         };
         debug!(chunk = %hash.to_hex(), from = %from, succeeded = %succeeded,
@@ -687,7 +680,7 @@ impl Pipeline {
             ..
         }) = self.remote_blob.as_mut()
         else {
-            debug!("No Remote blob.");
+            debug!("No remote blob.");
             return
         };
         debug!(chunk = %hash.to_hex(), succeeded = %succeeded, from = %from,
