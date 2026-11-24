@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::Arc,
-    path::Path
+    path::{PathBuf, Path}
 };
 use eyre::Result;
 use tracing::{info, warn, debug};
@@ -126,7 +126,7 @@ impl Pipeline {
         self.assign_chunks();
     }
 
-    async fn handle_publish_manifest_result(
+    fn handle_publish_manifest_result(
         &mut self,
         id: String,
         query_id: QueryId,
@@ -262,11 +262,7 @@ impl Pipeline {
             let chosen_peer = {
                 let mut rng = rand::rng();
                 use rand::seq::IndexedRandom;
-                let Some(peer) = assignable_peers.choose(&mut rng) else {
-                    warn!("Could not choose a peer: IndexedRandom misbehaved.");
-                    continue
-                };
-                **peer
+                **assignable_peers.choose(&mut rng).unwrap()
             };
             let hash_hex = hash.to_hex();
             let Ok(permit) = self
@@ -279,12 +275,15 @@ impl Pipeline {
                 );
                 break
             };
-            let (path, failed) = match chunk {
+            let (path, failed): (PathBuf, HashMap<PeerId, usize>) = match chunk {
                 LocalChunk::AwaitingAssignment => (
                     base_path.as_path().join(hash_hex.as_str()),
                     HashMap::new()
                 ),
-                LocalChunk::Assigned { path, failed, .. } => (path.clone(), failed.clone()),
+                LocalChunk::Assigned { path, failed, .. } => (
+                    path.clone(),
+                    failed.drain().collect()
+                ),
                 _ => continue
             };
             let inflight = Some(InflightPush {
@@ -302,7 +301,7 @@ impl Pipeline {
                 self.blob_transfer_control.clone(),
                 chosen_peer,
                 *hash,
-                path.clone(),
+                path,
                 permit,
                 self.tx_transfer_outcome.clone(),
             );
@@ -582,7 +581,7 @@ impl Pipeline {
 
     async fn handle_transfer_outcome_for_local_blob(
         &mut self,
-        from: PeerId,
+        to: PeerId,
         hash: Hash,
         succeeded: bool
     ) {
@@ -594,7 +593,7 @@ impl Pipeline {
             debug!("No local blob.");
             return
         };
-        debug!(chunk = %hash.to_hex(), from = %from, succeeded = %succeeded,
+        debug!(chunk = %hash.to_hex(), to = %to, succeeded = %succeeded,
             "A new outcome for the local blob."
         );
         let LocalBlob::Distributing { root_hash, merkle_leaves, chunks, .. } = local_blob
@@ -610,17 +609,17 @@ impl Pipeline {
             debug!("Not pushing.");
             return
         };
-        let Some(InflightPush { to, .. }) = inflight else {
+        let Some(InflightPush { to: ex_to, .. }) = inflight else {
             debug!("No active inflight push.");
             // todo: late success
             return
         };
-        if *to != from {
+        if *ex_to != to {
             debug!(expected = %to, "Peers do not match.");
             return
         }
         if succeeded {
-            *chunk = LocalChunk::Pushed(from);
+            *chunk = LocalChunk::Pushed(to);
             if chunks.values().all(|c| matches!(c, LocalChunk::Pushed(_))) {
                 let manifest = Manifest::Blob {
                     root_hash: *root_hash.as_bytes(),
@@ -644,19 +643,19 @@ impl Pipeline {
                 self.publish_manifest().await;
             }
         } else {
-            let attempts = failed.entry(from).or_default();
+            let attempts = failed.entry(to).or_default();
             *attempts += 1;
             *inflight = None;
             if *attempts >= MAX_RETRIES {
                 *chunk = LocalChunk::Failed;
-                // todo: wait for all inflight pushes to finish
+                // todo: early fail; wait for all inflight pushes to finish
                 *local_blob = LocalBlob::Failed;
                 self.archive_local_blob();
             }
         }
     }
 
-    async fn handle_transfer_outcome_for_remote_blob(
+    fn handle_transfer_outcome_for_remote_blob(
         &mut self,
         from: PeerId,
         hash: Hash,
@@ -720,7 +719,7 @@ impl Pipeline {
     ) {
         match direction {
             Direction::Pull => {
-                self.handle_transfer_outcome_for_remote_blob(from, hash, succeeded).await;
+                self.handle_transfer_outcome_for_remote_blob(from, hash, succeeded);
                 self.maintain_remote_blob().await;
             }
             Direction::Push => {
@@ -771,7 +770,7 @@ pub async fn run(
                         FromSwarm::PublishManifestResult { blob_id, query_id, succeeded } => {
                             pipeline.handle_publish_manifest_result(
                                 blob_id, query_id, succeeded
-                            ).await;
+                            );
                         }
                         FromSwarm::ManifestIsReady { id, manifest } => {
                             pipeline.handle_manifest(id, manifest).await;
@@ -819,6 +818,7 @@ pub async fn run(
                         _ => ()
                     }
                     None => {
+                        warn!("Transfer outcome channel is closed.");
                         break
                     }
                 },
