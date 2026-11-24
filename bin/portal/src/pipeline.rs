@@ -359,7 +359,8 @@ impl Pipeline {
                         "Failed to create a folder for the remote blob."
                     );
                     *remote_blob = RemoteBlob::Failed;
-                    // todo: failing here is cruel
+                    self.archive_remote_blob();
+                    // todo: early fail
                     return
                 }
                 let chunks: HashMap<Hash, RemoteChunk> = chunk_owners
