@@ -45,8 +45,12 @@ const MANIFEST_LOOKUP_DEADLINE: u64 = 5 * 60;
 
 struct Pipeline {
     db_pool: PgPool,
+
     remote_blob: Option<RemoteBlobContext>,
     local_blob: Option<LocalBlobContext>,
+
+    // to gate remote blob manifest's merkle tree verification
+    hashing: Arc<Semaphore>,
 
     storage_provider_hints: HashMap<PeerId, Instant>,
 
@@ -71,6 +75,7 @@ impl Pipeline {
             db_pool,
             remote_blob: None,
             local_blob: None,
+            hashing: Arc::new(Semaphore::new(2)),
             storage_provider_hints: HashMap::new(),
             tx_swarm,
             blob_transfer_control,
@@ -348,8 +353,37 @@ impl Pipeline {
                     return
                 }
                 let BlobManifest {
-                    root_hash, merkle_leaves: plain_merkle_leaves, chunk_owners
+                    root_hash: plain_root_hash,
+                    merkle_leaves: plain_merkle_leaves,
+                    chunk_owners
                 } = manifest;
+                // validate the given merkle tree
+                let Ok(permit) = self.hashing.clone().acquire_owned().await else {
+                    warn!(blob = %id, "No permits to calculate manifest's merkle root.");
+                    return
+                };
+                let tmp_leaves = plain_merkle_leaves.clone();
+                let Ok(Some(actual_root_hash)) = tokio::task::spawn_blocking(move || {
+                    use crate::blake3_wrapper::Blake3;
+                    use rs_merkle::MerkleTree;
+                    let r = MerkleTree::<Blake3>::from_leaves(&tmp_leaves)
+                        .root()
+                        .map(|h| Hash::from(h));
+                    drop(permit);
+                    r
+                }).await else {
+                    warn!(blob = %id, "Failed to calculate manifest's merkle root.");
+                    return
+                };
+                let expected_root_hash: Hash = plain_root_hash.into();
+                if expected_root_hash != actual_root_hash {
+                    warn!(blob = %id,
+                        expected = %expected_root_hash.to_hex(),
+                        actual = %actual_root_hash.to_hex(),
+                        "Manifest's root hash is invalid."
+                    );
+                    return
+                }
                 let mut merkle_leaves = Vec::with_capacity(plain_merkle_leaves.len());
                 let mut chunks = HashMap::with_capacity(plain_merkle_leaves.len());
                 for plain_hash in plain_merkle_leaves.iter() {
@@ -378,7 +412,7 @@ impl Pipeline {
                     }
                 }
                 *remote_blob = RemoteBlob::Gathering {
-                    root_hash: root_hash.into(),
+                    root_hash: expected_root_hash,
                     merkle_leaves,
                     base_path: blob_path,
                     chunks
