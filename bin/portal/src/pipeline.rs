@@ -1,6 +1,6 @@
 use std::{
     mem,
-    collections::{HashSet, HashMap},
+    collections::{HashMap, BTreeMap, BTreeSet},
     sync::Arc,
     path::{PathBuf, Path}
 };
@@ -18,7 +18,7 @@ use libp2p::{
 };
 use sqlx::PgPool;
 use crate::admission::{
-    BASE_BLOB_PATH, ToPipeline, CHUNK_SIZE
+    MAX_CHUNKS_PER_BLOB, CHUNK_SIZE, BASE_BLOB_PATH, ToPipeline,
 };
 use crate::blob::{
     LocalBlobContext, LocalBlob, LocalChunk, InflightPush,
@@ -50,9 +50,6 @@ struct Pipeline {
     remote_blob: Option<RemoteBlobContext>,
     local_blob: Option<LocalBlobContext>,
 
-    // to gate remote blob manifest's merkle tree verification
-    hashing: Arc<Semaphore>,
-
     storage_provider_hints: HashMap<PeerId, Instant>,
 
     tx_swarm: mpsc::Sender<ToSwarm>,
@@ -76,7 +73,6 @@ impl Pipeline {
             db_pool,
             remote_blob: None,
             local_blob: None,
-            hashing: Arc::new(Semaphore::new(2)),
             storage_provider_hints: HashMap::new(),
             tx_swarm,
             blob_transfer_control,
@@ -360,24 +356,22 @@ impl Pipeline {
                     chunk_owners
                 } = manifest;
                 // validate the given merkle tree
-                let Ok(permit) = self.hashing.clone().acquire_owned().await else {
-                    warn!(blob = %id, "No permits to calculate manifest's merkle root.");
-                    return
-                };
-                let tmp_leaves = plain_merkle_leaves.clone();
-                let Ok(Some(actual_root_hash)) = tokio::task::spawn_blocking(move || {
+                if plain_merkle_leaves.len() > MAX_CHUNKS_PER_BLOB {
+                    warn!(blob = %id, num_chunks = MAX_CHUNKS_PER_BLOB,
+                        "Manifest contains more chunks than allowed."
+                    );
+                }
+                let Some(actual_root_hash) = ({
                     use crate::blake3_wrapper::Blake3;
                     use rs_merkle::MerkleTree;
-                    let r = MerkleTree::<Blake3>::from_leaves(&tmp_leaves)
+                    MerkleTree::<Blake3>::from_leaves(&plain_merkle_leaves)
                         .root()
-                        .map(|h| Hash::from(h));
-                    drop(permit);
-                    r
-                }).await else {
+                        .map(Hash::from)
+                }) else {
                     warn!(blob = %id, "Failed to calculate manifest's merkle root.");
                     return
                 };
-                let expected_root_hash: Hash = plain_root_hash.into();
+                let expected_root_hash = Hash::from(plain_root_hash);
                 if expected_root_hash != actual_root_hash {
                     warn!(blob = %id,
                         expected = %expected_root_hash.to_hex(),
@@ -389,25 +383,25 @@ impl Pipeline {
                 let mut merkle_leaves = Vec::with_capacity(plain_merkle_leaves.len());
                 let mut chunks = HashMap::with_capacity(plain_merkle_leaves.len());
                 for plain_hash in plain_merkle_leaves.iter() {
-                    let hash = Hash::from(*plain_hash);
-                    merkle_leaves.push(hash);
-                    let hash_hex = hash.to_hex();
+                    let chunk_hash = Hash::from(*plain_hash);
+                    merkle_leaves.push(chunk_hash);
+                    let chunk_hash_hex = chunk_hash.to_hex();
                     if let Some(owner) = chunk_owners
                         .iter()
                         .find(|(_, chunk_list)| chunk_list.contains(plain_hash))
                         .map(|(owner, _)| owner)
                     {
                         chunks.insert(
-                            hash,
+                            chunk_hash,
                             RemoteChunk::Pulling {
-                                path: blob_path.as_path().join(hash_hex.as_str()),
+                                path: blob_path.as_path().join(chunk_hash_hex.as_str()),
                                 owners: [*owner].into(),
                                 inflight: None,
                                 failed: HashMap::new()
                             }
                         );
                     } else {
-                        warn!(chunk = %hash_hex,
+                        warn!(chunk = %chunk_hash_hex,
                             "No owners found for the chunk, manifest is invalid."
                         );
                         return
@@ -669,11 +663,11 @@ impl Pipeline {
             *chunk = LocalChunk::Pushed(to);
             if chunks.values().all(|c| matches!(c, LocalChunk::Pushed(_))) {
                 let mut plain_merkle_leaves = Vec::with_capacity(chunks.len());
-                let mut chunk_owners: HashMap<PeerId, HashSet<[u8; 32]>> = HashMap::new();
+                let mut chunk_owners: BTreeMap<PeerId, BTreeSet<[u8; 32]>> = BTreeMap::new();
                 for hash in merkle_leaves.iter() {
                     let plain_hash: [u8; 32] = *hash.as_bytes();
                     plain_merkle_leaves.push(plain_hash);
-                    let owner = chunks.get(&hash).unwrap().extract_owner().unwrap();
+                    let owner = chunks.get(hash).unwrap().extract_owner().unwrap();
                     chunk_owners.entry(owner).or_default().insert(plain_hash);
                 }
                 let manifest = BlobManifest {

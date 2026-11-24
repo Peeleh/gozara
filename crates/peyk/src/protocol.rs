@@ -1,4 +1,4 @@
-use std::collections::{HashSet, HashMap};
+use std::collections::{BTreeSet, BTreeMap};
 use serde::{Deserialize, Serialize};
 use libp2p::PeerId;
 
@@ -7,7 +7,7 @@ pub struct BlobManifest {
     pub root_hash: [u8; 32],
     pub merkle_leaves: Vec<[u8; 32]>,
     // <owner, chunk hash>
-    pub chunk_owners: HashMap<PeerId, HashSet<[u8; 32]>>
+    pub chunk_owners: BTreeMap<PeerId, BTreeSet<[u8; 32]>>
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -27,11 +27,9 @@ use std::str::FromStr;
 use sqlx::postgres::PgPool;
 use crate::blake3_wrapper::Blake3;
 use crate::admission::{
-    BASE_BLOB_PATH, BlobStatus, ToPipeline, CHUNK_SIZE
+    MAX_BLOB_SIZE, CHUNK_SIZE,
+    BASE_BLOB_PATH, BlobStatus, ToPipeline,
 };
-
-// 512 MiB
-const MAX_BLOB_SIZE: usize = 1<<29;
 
 // each permit = 4 MiB, in total 16 GiB worth of "upload permits/memory pressure"
 const TOTAL_CHUNK_BUDGET: usize = 1<<12;

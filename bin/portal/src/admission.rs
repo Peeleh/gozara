@@ -5,6 +5,10 @@ use tokio::sync::OwnedSemaphorePermit;
 pub const CHUNK_SIZE: usize = 1<<22;
 // blob storage path on disk
 pub const BASE_BLOB_PATH: &str = "./blobs";
+// 512 MiB
+pub const MAX_BLOB_SIZE: usize = 1<<29;
+// 128 chunks: 128 * 4 = 512 MiB
+pub const MAX_CHUNKS_PER_BLOB: usize = 1<<7;
 
 #[derive(sqlx::Type, Debug, Clone)]
 #[sqlx(type_name = "status", rename_all = "lowercase")]
