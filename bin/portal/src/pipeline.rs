@@ -1,4 +1,5 @@
 use std::{
+    mem,
     collections::{HashSet, HashMap},
     sync::Arc,
     path::{PathBuf, Path}
@@ -241,7 +242,7 @@ impl Pipeline {
             .map(|(peer, _)| *peer)
             .collect();
         if peers.is_empty() {
-            warn!("No eligible peers to assign chunks.");
+            debug!("No eligible peers to assign chunks.");
             return
         }
         let is_eligible = |lc: &LocalChunk, peers: &[PeerId]| match lc {
@@ -267,7 +268,9 @@ impl Pipeline {
             let chosen_peer = {
                 let mut rng = rand::rng();
                 use rand::seq::IndexedRandom;
-                **assignable_peers.choose(&mut rng).unwrap()
+                **assignable_peers
+                    .choose(&mut rng)
+                    .unwrap()
             };
             let hash_hex = hash.to_hex();
             let Ok(permit) = self
@@ -287,7 +290,7 @@ impl Pipeline {
                 ),
                 LocalChunk::Assigned { path, failed, .. } => (
                     path.clone(),
-                    failed.drain().collect()
+                    mem::take(failed)
                 ),
                 _ => continue
             };
@@ -318,7 +321,6 @@ impl Pipeline {
         peer: PeerId
     ) {
         self.storage_provider_hints.insert(peer, Instant::now());
-        self.assign_chunks();
     }
 
     async fn handle_manifest(
@@ -660,7 +662,7 @@ impl Pipeline {
             return
         };
         if *ex_to != to {
-            debug!(expected = %to, "Peers do not match.");
+            debug!(expected = %ex_to, "Peers do not match.");
             return
         }
         if succeeded {
@@ -807,6 +809,7 @@ pub async fn run(
                     Some(h_msg) => match h_msg {
                         // a gossip by storage providers
                         FromSwarm::WouldStore(peer) => {
+                            // todo: tackle flooding attacks
                             pipeline.add_storage_hint(peer);
                         }
                         FromSwarm::Request { .. } => {}
