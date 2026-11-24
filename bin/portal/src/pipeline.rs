@@ -41,7 +41,6 @@ const MAX_RETRIES: usize = 5;
 // 30 minutes before a blob is marked as failed
 const BLOB_STALE_DEADLINE: u64 = 30 * 60;
 
-// 5 minutes before a chunk is marked as failed
 const MANIFEST_LOOKUP_DEADLINE: u64 = 5 * 60;
 
 struct Pipeline {
@@ -49,9 +48,7 @@ struct Pipeline {
     remote_blob: Option<RemoteBlobContext>,
     local_blob: Option<LocalBlobContext>,
 
-    // record decaying WouldStore gossips
     storage_provider_hints: HashMap<PeerId, Instant>,
-    storage_permits: HashMap<PeerId, Instant>,
 
     tx_swarm: mpsc::Sender<ToSwarm>,
 
@@ -75,7 +72,6 @@ impl Pipeline {
             remote_blob: None,
             local_blob: None,
             storage_provider_hints: HashMap::new(),
-            storage_permits: HashMap::new(),
             tx_swarm,
             blob_transfer_control,
             tx_transfer_outcome,
@@ -208,23 +204,6 @@ impl Pipeline {
         }
     }
 
-    async fn request_storage_permits(&mut self) {
-        if self.storage_provider_hints.is_empty() {
-            warn!("No storage providers out there to request permits from.");
-            return
-        }
-        let now = Instant::now();
-        self.storage_permits.retain(|_, expires_at| *expires_at > now);
-        if !self.storage_permits.is_empty() {
-                // todo: check if there are enough permits
-            return
-        }
-        // todo: peers size should not be large
-        let _ = self.tx_swarm.send(ToSwarm::StoragePermit {
-            peers: self.storage_provider_hints.keys().cloned().collect()
-        }).await;
-    }
-
     fn archive_local_blob(&mut self) {
         let Some(LocalBlobContext {
             id,
@@ -252,9 +231,8 @@ impl Pipeline {
         };
         let now = Instant::now();
         let peers: Vec<PeerId> = self
-            .storage_permits
+            .storage_provider_hints
             .iter()
-            .filter(|(_, expires_at)| **expires_at > now)
             .map(|(peer, _)| *peer)
             .collect();
         if peers.is_empty() {
@@ -329,6 +307,14 @@ impl Pipeline {
                 self.tx_transfer_outcome.clone(),
             );
         }
+    }
+
+    fn add_storage_hint(
+        &mut self,
+        peer: PeerId
+    ) {
+        self.storage_provider_hints.insert(peer, Instant::now());
+        self.assign_chunks();
     }
 
     async fn handle_manifest(
@@ -778,23 +764,10 @@ pub async fn run(
                     Some(h_msg) => match h_msg {
                         // a gossip by storage providers
                         FromSwarm::WouldStore(peer) => {
-                            pipeline.storage_provider_hints.insert(peer, Instant::now());
+                            pipeline.add_storage_hint(peer);
                         }
                         FromSwarm::Request { .. } => {}
-                        FromSwarm::Response { peer, response, .. } => {
-                            match response {
-                                peyk::protocol::Response::IssuedStoragePermit { valid_for } => {
-                                    let now = Instant::now();
-                                    pipeline.storage_permits.insert(
-                                        peer,
-                                        now.checked_add(Duration::from_secs(valid_for))
-                                        .unwrap_or(now)
-                                    );
-                                    // todo: storage permit is already invalid in case of overflow
-                                    pipeline.assign_chunks();
-                                }
-                            }
-                        }
+                        FromSwarm::Response { .. } => {}
                         FromSwarm::PublishManifestResult { blob_id, query_id, succeeded } => {
                             pipeline.handle_publish_manifest_result(
                                 blob_id, query_id, succeeded

@@ -30,9 +30,6 @@ use p2p::{GlobalBehaviour, GlobalBehaviourEvent};
 pub use libp2p_stream::Control;
 
 pub enum ToSwarm {
-    StoragePermit {
-        peers: Vec<PeerId>,
-    },
     PublishManifest {
         blob_id: String,
         manifest: protocol::Manifest,
@@ -101,17 +98,6 @@ pub async fn process_swarm(
                 // ToSwarm messages
                 r = rx.recv() =>  match r {
                     Some(m) => match m {
-                        ToSwarm::StoragePermit { peers } => {
-                            for peer in peers.iter() {
-                                let _ = swarm
-                                    .behaviour_mut()
-                                    .req_resp
-                                    .send_request(
-                                        peer,
-                                        protocol::Request::StoragePermit
-                                    );
-                            }
-                        }
                         ToSwarm::PublishManifest { blob_id, manifest, expires_at, tx_reply } => {
                             let value = match bincode::serialize(&manifest) {
                                 Ok(v) => v,

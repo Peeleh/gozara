@@ -11,14 +11,7 @@ pub enum Manifest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum Request {
-    StoragePermit,
-}
+pub enum Request {}
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum Response {
-    // convention: each permit is worth ~20 chunks of storage space
-    IssuedStoragePermit {
-        valid_for: u64 // seconds
-    },
-}
+pub enum Response {}
