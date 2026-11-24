@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashSet, HashMap},
     sync::Arc,
     path::{PathBuf, Path}
 };
@@ -350,8 +350,8 @@ impl Pipeline {
                 let BlobManifest {
                     root_hash, merkle_leaves: plain_merkle_leaves, chunk_owners
                 } = manifest;
-                let mut merkle_leaves = vec![];
-                let mut chunks: HashMap<Hash, RemoteChunk> = HashMap::new();
+                let mut merkle_leaves = Vec::with_capacity(plain_merkle_leaves.len());
+                let mut chunks = HashMap::with_capacity(plain_merkle_leaves.len());
                 for plain_hash in plain_merkle_leaves.iter() {
                     let hash = Hash::from(*plain_hash);
                     merkle_leaves.push(hash);
@@ -633,12 +633,12 @@ impl Pipeline {
             *chunk = LocalChunk::Pushed(to);
             if chunks.values().all(|c| matches!(c, LocalChunk::Pushed(_))) {
                 let mut plain_merkle_leaves = Vec::with_capacity(chunks.len());
-                let mut chunk_owners: HashMap<PeerId, Vec<[u8; 32]>> = HashMap::new();
+                let mut chunk_owners: HashMap<PeerId, HashSet<[u8; 32]>> = HashMap::new();
                 for hash in merkle_leaves.iter() {
                     let plain_hash: [u8; 32] = *hash.as_bytes();
                     plain_merkle_leaves.push(plain_hash);
                     let owner = chunks.get(&hash).unwrap().extract_owner().unwrap();
-                    chunk_owners.entry(owner).or_default().push(plain_hash);
+                    chunk_owners.entry(owner).or_default().insert(plain_hash);
                 }
                 let manifest = BlobManifest {
                     root_hash: *root_hash.as_bytes(),
