@@ -11,7 +11,7 @@ use libp2p::{
     kad::QueryId
 };
 use blake3::Hash;
-use peyk::protocol::Manifest;
+use peyk::protocol::BlobManifest;
 
 // remote blob
 #[derive(Debug)]
@@ -88,7 +88,7 @@ pub enum LocalBlob {
         _admission_permit: OwnedSemaphorePermit
     },
     AwaitingPublishManifest {
-        manifest: Manifest,
+        manifest: BlobManifest,
         attempts: Vec<(QueryId, Instant)>,
         failed: usize,
     },

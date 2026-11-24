@@ -27,7 +27,7 @@ use peyk::{
     blob_transfer,
     blob_transfer::{Direction, TransferOutcome, Outcome, TIMEOUT_WINDOW},
     FromSwarm, ToSwarm,
-    protocol::Manifest,
+    protocol::BlobManifest,
 };
 
 // one hour
@@ -319,9 +319,8 @@ impl Pipeline {
     async fn handle_manifest(
         &mut self,
         id: String,
-        manifest: Manifest
+        manifest: BlobManifest
     ) {
-        let Manifest::Blob { root_hash, chunks: chunk_owners } = manifest;
         let Some(RemoteBlobContext {
             id: remote_id,
             blob: remote_blob,
@@ -343,32 +342,44 @@ impl Pipeline {
                     warn!(blob = %id, error = %e, path = %blob_path.display(),
                         "Failed to create a folder for the remote blob."
                     );
+                    // todo: early fail
                     *remote_blob = RemoteBlob::Failed;
                     self.archive_remote_blob();
-                    // todo: early fail
                     return
                 }
-                let chunks: HashMap<Hash, RemoteChunk> = chunk_owners
-                    .iter()
-                    .map(|(plain_hash, peer)| {
-                        let hash = Hash::from(*plain_hash);
-                        (
+                let BlobManifest {
+                    root_hash, merkle_leaves: plain_merkle_leaves, chunk_owners
+                } = manifest;
+                let mut merkle_leaves = vec![];
+                let mut chunks: HashMap<Hash, RemoteChunk> = HashMap::new();
+                for plain_hash in plain_merkle_leaves.iter() {
+                    let hash = Hash::from(*plain_hash);
+                    merkle_leaves.push(hash);
+                    let hash_hex = hash.to_hex();
+                    if let Some(owner) = chunk_owners
+                        .iter()
+                        .find(|(_, chunk_list)| chunk_list.contains(plain_hash))
+                        .map(|(owner, _)| owner)
+                    {
+                        chunks.insert(
                             hash,
                             RemoteChunk::Pulling {
-                                path: blob_path.as_path().join(hash.to_hex().as_str()),
-                                owners: [*peer].into(),
+                                path: blob_path.as_path().join(hash_hex.as_str()),
+                                owners: [*owner].into(),
                                 inflight: None,
                                 failed: HashMap::new()
                             }
-                        )
-                    })
-                    .collect();
+                        );
+                    } else {
+                        warn!(chunk = %hash_hex,
+                            "No owners found for the chunk, manifest is invalid."
+                        );
+                        return
+                    }
+                }
                 *remote_blob = RemoteBlob::Gathering {
                     root_hash: root_hash.into(),
-                    merkle_leaves: chunk_owners
-                        .into_iter()
-                        .map(|(h, _)| h.into())
-                        .collect(),
+                    merkle_leaves,
                     base_path: blob_path,
                     chunks
                 };
@@ -621,19 +632,18 @@ impl Pipeline {
         if succeeded {
             *chunk = LocalChunk::Pushed(to);
             if chunks.values().all(|c| matches!(c, LocalChunk::Pushed(_))) {
-                let manifest = Manifest::Blob {
+                let mut plain_merkle_leaves = Vec::with_capacity(chunks.len());
+                let mut chunk_owners: HashMap<PeerId, Vec<[u8; 32]>> = HashMap::new();
+                for hash in merkle_leaves.iter() {
+                    let plain_hash: [u8; 32] = *hash.as_bytes();
+                    plain_merkle_leaves.push(plain_hash);
+                    let owner = chunks.get(&hash).unwrap().extract_owner().unwrap();
+                    chunk_owners.entry(owner).or_default().push(plain_hash);
+                }
+                let manifest = BlobManifest {
                     root_hash: *root_hash.as_bytes(),
-                    chunks: merkle_leaves
-                        .iter()
-                        .map(|h| (
-                            *h.as_bytes(),
-                            chunks
-                                .get(h)
-                                .unwrap()
-                                .extract_owner()
-                                .unwrap()
-                        ))
-                        .collect()
+                    merkle_leaves: plain_merkle_leaves,
+                    chunk_owners
                 };
                 *local_blob = LocalBlob::AwaitingPublishManifest {
                     manifest,
@@ -703,7 +713,7 @@ impl Pipeline {
             *inflight = None;
             if *attempts >= MAX_RETRIES {
                 *chunk = RemoteChunk::Failed;
-                // todo: wait for all inflight pulls to finish
+                // todo: early fail; wait for all inflight pulls to finish
                 *remote_blob = RemoteBlob::Failed;
                 self.archive_remote_blob();
             }

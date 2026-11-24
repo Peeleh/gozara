@@ -32,7 +32,7 @@ pub use libp2p_stream::Control;
 pub enum ToSwarm {
     PublishManifest {
         blob_id: String,
-        manifest: protocol::Manifest,
+        manifest: protocol::BlobManifest,
         expires_at: Instant,
         tx_reply: oneshot::Sender<kad::QueryId>
     },
@@ -62,7 +62,7 @@ pub enum FromSwarm {
     },
     ManifestIsReady {
         id: String,
-        manifest: protocol::Manifest
+        manifest: protocol::BlobManifest
     }
 }
 
@@ -277,7 +277,7 @@ pub async fn process_swarm(
                             continue
                         };
                         debug!(blob = %id, query = %query_id, "GetRecord succeeded.");
-                        let manifest: protocol::Manifest = match bincode::deserialize(&peer_record.record.value) {
+                        let manifest: protocol::BlobManifest = match bincode::deserialize(&peer_record.record.value) {
                             Ok(m) => m,
                             Err(e) => {
                                 debug!(error = %e, "Manifest decode failed.");
