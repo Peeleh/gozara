@@ -357,9 +357,10 @@ impl Pipeline {
                 } = manifest;
                 // validate the given merkle tree
                 if plain_merkle_leaves.len() > MAX_CHUNKS_PER_BLOB {
-                    warn!(blob = %id, num_chunks = MAX_CHUNKS_PER_BLOB,
+                    warn!(blob = %id, num_chunks = %plain_merkle_leaves.len(),
                         "Manifest contains more chunks than allowed."
                     );
+                    return
                 }
                 let Some(actual_root_hash) = ({
                     use crate::blake3_wrapper::Blake3;
