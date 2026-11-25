@@ -1,12 +1,18 @@
 use blake3::Hash;
 use tokio::sync::OwnedSemaphorePermit;
 
-// 4 MiB
+// each chunk is 4 MiB
 pub const CHUNK_SIZE: usize = 1<<22;
+
+// each permit = 4 MiB, in total 16 GiB worth of disk pressure
+pub const TOTAL_CHUNK_BUDGET: usize = 1<<12;
+
 // blob storage path on disk
 pub const BASE_BLOB_PATH: &str = "./blobs";
+
 // 512 MiB
 pub const MAX_BLOB_SIZE: usize = 1<<29;
+
 // 128 chunks: 128 * 4 = 512 MiB
 pub const MAX_CHUNKS_PER_BLOB: usize = 1<<7;
 

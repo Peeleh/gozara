@@ -27,12 +27,9 @@ use std::str::FromStr;
 use sqlx::postgres::PgPool;
 use crate::blake3_wrapper::Blake3;
 use crate::admission::{
-    MAX_BLOB_SIZE, CHUNK_SIZE,
+    MAX_BLOB_SIZE, CHUNK_SIZE, TOTAL_CHUNK_BUDGET,
     BASE_BLOB_PATH, BlobStatus, ToPipeline,
 };
-
-// each permit = 4 MiB, in total 16 GiB worth of "upload permits/memory pressure"
-const TOTAL_CHUNK_BUDGET: usize = 1<<12;
 
 // max silence between frames
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
