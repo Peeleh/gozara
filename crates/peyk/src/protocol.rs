@@ -6,7 +6,7 @@ use libp2p::PeerId;
 pub struct BlobManifest {
     pub root_hash: [u8; 32],
     pub merkle_leaves: Vec<[u8; 32]>,
-    // <owner, chunk hash>
+    // <owner, [chunks]>
     pub chunk_owners: BTreeMap<PeerId, BTreeSet<[u8; 32]>>
 }
 

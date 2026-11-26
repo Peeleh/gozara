@@ -44,11 +44,6 @@ fn go_public(config: Config) -> Result<Swarm<peyk::p2p::GlobalBehaviour>> {
             new_key
         }
     };
-    let my_peer_id = PeerId::from_public_key(&local_key.public());
-    info!(
-        "My peer id: `{}`",
-        my_peer_id
-    );
     let mut swarm = peyk::p2p::setup_global_swarm(&local_key)?;
     // listen on all interfaces
     // ipv4

@@ -362,13 +362,14 @@ impl Pipeline {
                     );
                     return
                 }
-                let Some(actual_root_hash) = ({
+                let calculated_root_hash = {
                     use crate::blake3_wrapper::Blake3;
                     use rs_merkle::MerkleTree;
                     MerkleTree::<Blake3>::from_leaves(&plain_merkle_leaves)
                         .root()
                         .map(Hash::from)
-                }) else {
+                };
+                let Some(actual_root_hash) = calculated_root_hash else {
                     warn!(blob = %id, "Failed to calculate manifest's merkle root.");
                     return
                 };

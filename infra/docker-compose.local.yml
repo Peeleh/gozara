@@ -1,0 +1,16 @@
+services:
+  boot:
+    build: .
+    environment: [SEED=1]                     # fixed key -> fixed PeerId
+    networks: { lab: { ipv4_address: 172.30.0.10 } }
+  node:
+    build: .
+    depends_on: [boot]
+    deploy: { replicas: 5 }                  # random keys, auto-assigned IPs
+    environment:
+      - BOOTNODE=/ip4/172.30.0.10/tcp/4001/p2p/${BOOTNODE_PEER_ID}   # from .env
+    mem_limit: 512m
+    networks: [lab]
+networks:
+  lab:
+    ipam: { config: [{ subnet: 172.30.0.0/24 }] }

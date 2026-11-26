@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     if let Err(e) = dotenvy::dotenv() {
         eprintln!("not loading .env file: {e}");
     }
-    info!("Loading environment variables.");
+    info!("Loaded environment variables.");
     let cfg = Config {
         key_file: env::var("KEY_FILE").ok(),
         bootnode_peer_id: env::var("BOOTNODE_PEER_ID")
